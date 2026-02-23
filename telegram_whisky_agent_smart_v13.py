@@ -81,6 +81,27 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
 # ==========================================
 _FORECAST_CACHE = {"stock_map": None, "last_update": 0}
 
+_HE_STOPWORDS = {
+    "האם","יש","לי","של","את","זה","זו","בבקשה","בבקבוק","בקבוק","בקבוקים",
+    "do","i","have","got","a","an","the","of","and","in","to"
+}
+
+def _tokenize_simple(s: str) -> set[str]:
+    t = _normalize_text(s)
+    # keep words and numbers
+    parts = re.findall(r"[a-z0-9א-ת]+", t, flags=re.IGNORECASE)
+    return {p for p in parts if p and p not in _HE_STOPWORDS and len(p) >= 2}
+
+def _token_overlap_ok(query: str, candidate: str, min_overlap: float = 0.60) -> bool:
+    q = _tokenize_simple(query)
+    c = _tokenize_simple(candidate)
+    if not q:
+        return False
+    inter = len(q & c)
+    ratio = inter / max(1, len(q))
+    return ratio >= min_overlap
+
+
 def get_forecast_current_status_map(force_refresh: bool = False) -> dict:
     """Try to fetch bottle_id -> current_status from forecast table.
 
@@ -118,96 +139,107 @@ def get_forecast_current_status_map(force_refresh: bool = False) -> dict:
         return {}
 
 
-def build_df_schema_context(df: pd.DataFrame, max_cats_per_col: int = 12) -> dict:
-    ctx = {"columns": []}
-    if df is None or df.empty:
-        return ctx
-
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        entry = {"name": col, "dtype": dtype}
-
-        # add small examples for object/categorical
-        if dtype == "object":
-            vals = (
-                df[col].dropna().astype(str).map(lambda x: x.strip()).loc[lambda s: s != ""].unique().tolist()
-            )
-            if vals:
-                entry["examples"] = vals[:max_cats_per_col]
-        ctx["columns"].append(entry)
-
-    return ctx
-
 
 import ast
 import re
 
-def _normalize_to_list(x):
-    """
-    Normalize x into flat list[str], handling:
-      - ['A','B']
-      - "['A','B']"
-      - "['A' 'B']"   <-- IMPORTANT: missing commas (numpy-ish)
-      - ["['A' 'B']"] <-- list containing string representation
-      - "A, B" / "A\nB"
-    """
-    def _extract_quoted_tokens(s: str) -> list[str]:
-        # extract '...' or "..."
-        toks = re.findall(r"'([^']+)'\s*|\"([^\"]+)\"\s*", s)
+def normalize_to_list(x):
+    if x is None:
+        return []
+    if isinstance(x, list):
         out = []
-        for a, b in toks:
-            t = (a or b or "").strip()
-            if t:
-                out.append(t)
+        for v in x:
+            out.extend(normalize_to_list(v))
         return out
 
-    def parse_one(item):
-        if item is None:
-            return []
+    s = str(x).strip()
+    if not s:
+        return []
 
-        if isinstance(item, (list, tuple)):
+    # try literal_eval for "['A','B']"
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+        try:
+            parsed = ast.literal_eval(s)
+            return normalize_to_list(parsed)
+        except Exception:
+            # fallback: extract quoted tokens
+            toks = re.findall(r"'([^']+)'|\"([^\"]+)\"", s)
             out = []
-            for it in item:
-                out.extend(parse_one(it))
-            return out
+            for a,b in toks:
+                t = (a or b or "").strip()
+                if t:
+                    out.append(t)
+            if out:
+                return out
+            # last resort split
+            inner = s.strip("[]()")
+            return [p.strip() for p in re.split(r"[,;\n]+", inner) if p.strip()]
 
-        s = str(item).strip()
-        if not s:
-            return []
+    # plain string
+    return [p.strip() for p in re.split(r"[,;\n]+", s) if p.strip()]
 
-        # If looks like list literal
-        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
-            # 1) try literal_eval (works for proper Python list strings)
-            try:
-                parsed = ast.literal_eval(s)
-                return parse_one(parsed)
-            except Exception:
-                # 2) handle "['A' 'B']" (no commas) by extracting quoted tokens
-                quoted = _extract_quoted_tokens(s)
-                if quoted:
-                    return quoted
 
-                # 3) last resort split
-                inner = s.strip("[]()")
-                parts = re.split(r"[,;\n]+", inner)
-                return [p.strip() for p in parts if p.strip()]
+def compute_cask_ranking(df: pd.DataFrame, col="casks_aged_in") -> pd.DataFrame:
+    counts = {}
+    for x in df[col].dropna().tolist():
+        for it in normalize_to_list(x):
+            it = str(it).strip()
+            if not it:
+                continue
+            counts[it] = counts.get(it, 0) + 1
 
-        # Normal split
-        parts = re.split(r"[,;\n]+", s)
-        return [p.strip() for p in parts if p.strip()]
+    if not counts:
+        return pd.DataFrame(columns=["casks_aged_in", "count"])
 
-    vals = parse_one(x)
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return pd.DataFrame(items, columns=["casks_aged_in", "count"])
 
-    # de-dup preserve order
-    cleaned, seen = [], set()
-    for v in vals:
-        vv = str(v).strip()
-        if not vv:
-            continue
-        if vv not in seen:
-            cleaned.append(vv)
-            seen.add(vv)
-    return cleaned
+def format_result(res):
+    # אם זה מספר בודד (COUNT / SUM וכו')
+    if not hasattr(res, "shape"):
+        return f"התוצאה היא: {res}"
+
+    rows, cols = res.shape
+
+    # אם אין תוצאות
+    if rows == 0:
+        return "לא נמצאו תוצאות."
+
+    # אם תא בודד
+    if rows == 1 and cols == 1:
+        val = res.iloc[0, 0]
+        return f"התוצאה היא: {val}"
+
+    # אם שורה אחת (תוצאה מצומצמת)
+    if rows == 1:
+        parts = [f"{col}: {res.iloc[0][col]}" for col in res.columns]
+        return " | ".join(parts)
+
+    # אם עד 5 שורות – טבלה קטנה
+    if rows <= 5:
+        return res.to_string(index=False)
+
+    # טבלה גדולה
+    preview = res.head(10).to_string(index=False)
+    return f"נמצאו {rows} תוצאות.\n\nטופ 10:\n{preview}"
+
+def format_top_casks(df_rank):
+    top_name = df_rank.iloc[0]["casks_aged_in"]
+    top_count = int(df_rank.iloc[0]["count"])
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    lines = []
+    for i, (_, row) in enumerate(df_rank.head(5).iterrows()):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(f"{medal} {row['casks_aged_in']} — {int(row['count'])}")
+
+    return (
+        "🥃 החבית הכי פופולרית אצלך\n"
+        f"{top_name}\n"
+        f"סה״כ: {top_count} בקבוקים\n\n"
+        "🏆 טופ 5:\n"
+        + "\n".join(lines)
+    )
 
 def _split_concatenated_by_vocab(s: str, options: list[str]) -> list[str] | None:
     """
@@ -380,11 +412,49 @@ _HAVE_HINTS = ("יש לי", "do i have", "have i got")
 _UPDATE_HINTS = ("שתיתי", "מזגתי", "מזיגה", "שתייה", "עדכן", "הורד", "פחת", "drank", "poured", "drink", "update", "reduce")
 _CONFIRM_YES = ("כן", "כן.", "כן!", "יאפ", "y", "yes", "sure", "ok", "אוקיי", "אוקי")
 _CONFIRM_NO = ("לא", "לא.", "לא!", "n", "no", "nope")
-_CANCEL_WORDS = ("ביטול", "cancel", "/cancel", "צא", "exit", "stop")
+_CANCEL_WORDS = ("ביטול", "בטל", "/בטל", "cancel", "/cancel", "צא", "exit", "stop")
 
 def _looks_like_count_query(text: str) -> bool:
     t = _normalize_text(text)
     return any(h in t for h in _COUNT_HINTS) and (any(h in t for h in _BOTTLE_HINTS) or any(h in t for h in _HAVE_HINTS))
+
+
+def _looks_like_have_query(text: str) -> bool:
+    """
+    True for: "האם יש לי X?", "יש לי X?", "do i have X?"
+    Excludes "כמה..." which is handled by count intent.
+    """
+    t = _normalize_text(text)
+    if any(h in t for h in _COUNT_HINTS):
+        return False
+    return any(h in t for h in _HAVE_HINTS)
+
+def _extract_entity_for_have(text: str) -> str:
+    """
+    Extract entity from have-queries:
+      - 'האם יש לי Glenfiddich Project XX?'
+      - 'יש לי m&h?'
+      - 'do i have lagavulin 16?'
+    """
+    t = text.strip()
+
+    patterns = [
+        r"(?:האם\s+)?יש\s+לי\s+(.+?)(?:\?|$)",
+        r"do\s+i\s+have\s+(.+?)(?:\?|$)",
+        r"have\s+i\s+got\s+(.+?)(?:\?|$)",
+    ]
+    for p in patterns:
+        m = re.search(p, t, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    # fallback: remove just the "have" hint words
+    tt = _normalize_text(t)
+    for h in _HAVE_HINTS:
+        tt = tt.replace(_normalize_text(h), " ")
+    tt = re.sub(r"\s+", " ", tt).strip()
+    return tt
+
 
 def _looks_like_update(text: str) -> bool:
     t = _normalize_text(text)
@@ -476,6 +546,131 @@ _STOCK_HINTS = (
     "כמה נשאר", "כמה נשאר לי", "כמה נשאר מהבקבוק", "וכמה נשאר", "נשאר",
     "remaining", "left", "stock", "מלאי", "מלאי נשאר"
 )
+
+
+# Portfolio / share analytics (NOT "remaining stock")
+# Examples:
+# - "מה אחוז בקבוקי הוויסקי שלי מכלל האלכוהול שלי?"
+# - "what percentage of my bottles are whisky?"
+_PORTFOLIO_SHARE_HINTS = (
+    "מכלל", "מתוך", "בסך", "סה\"כ", "סהכ",
+    "overall", "total", "out of", "percentage of", "percent of",
+    "share of", "ratio of"
+)
+
+def _looks_like_portfolio_share_query(text: str) -> bool:
+    t = _normalize_text(text)
+    if not t:
+        return False
+
+    # Must be a percent-ish question
+    has_percent = ("אחוז" in t) or ("%" in text) or ("percent" in t) or ("percentage" in t)
+
+    if not has_percent:
+        return False
+
+    # Explicitly avoid "remaining in bottle" stock questions
+    if any(w in t for w in ("נשאר", "remaining", "left", "מלאי")):
+        return False
+
+    # Needs an "overall / total" framing
+    if not any(h in t for h in _PORTFOLIO_SHARE_HINTS):
+        return False
+
+    # Likely about the collection (bottles/alcohol types)
+    if ("בקבוק" in t) or ("bottle" in t) or ("alcohol" in t) or ("אלכוהול" in t):
+        return True
+
+    # If user wrote just category + percent + total, still treat as portfolio share
+    return True
+
+# ==========================================
+# Fast deterministic portfolio analytics (no Gemini)
+# Handles: counts, percentages of total, popular casks
+# ==========================================
+
+_WHISKY_PATTERNS = (
+    r"whisky", r"whiskey", r"single\\s*malt", r"blended\\s*whisky", r"scotch", r"bourbon", r"rye"
+)
+_WINE_PATTERNS = (r"\\bwine\\b", r"red\\s*wine", r"white\\s*wine", r"dessert\\s*wine")
+
+def _col_as_str_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series([], dtype="string")
+    return df[col].fillna("").astype(str)
+
+def _count_bottles(df: pd.DataFrame, mask: pd.Series | None = None) -> int:
+    if df is None or df.empty:
+        return 0
+    sub = df if mask is None else df[mask]
+    if sub.empty:
+        return 0
+    if "bottle_id" in sub.columns:
+        try:
+            return int(sub["bottle_id"].nunique())
+        except Exception:
+            return int(len(sub))
+    return int(len(sub))
+
+def _detect_category(user_text: str) -> dict | None:
+    t = _normalize_text(user_text)
+
+    # wine subtypes
+    if "יין אדום" in t or ("red wine" in t):
+        return {"kind": "wine_red"}
+    if "יין לבן" in t or ("white wine" in t):
+        return {"kind": "wine_white"}
+    if "יין" in t or ("wine" in t):
+        return {"kind": "wine"}
+
+    # whisky
+    if "וויסקי" in t or "ויסקי" in t or "whisky" in t or "whiskey" in t:
+        return {"kind": "whisky"}
+
+    return None
+
+def _make_category_mask(df: pd.DataFrame, kind: str) -> pd.Series:
+    s = _col_as_str_series(df, "alcohol_type").str.lower()
+
+    if kind == "whisky":
+        pat = "(" + "|".join(_WHISKY_PATTERNS) + ")"
+        return s.str.contains(pat, regex=True, na=False)
+
+    if kind == "wine":
+        return s.str.contains("(" + "|".join(_WINE_PATTERNS) + ")", regex=True, na=False)
+
+    if kind == "wine_red":
+        return s.str.contains(r"red\\s*wine", regex=True, na=False)
+
+    if kind == "wine_white":
+        return s.str.contains(r"white\\s*wine", regex=True, na=False)
+
+    return pd.Series([False] * len(df))
+
+def _is_count_question(user_text: str) -> bool:
+    t = _normalize_text(user_text)
+    return ("כמה בקבוק" in t) or ("how many bottle" in t) or ("number of bottle" in t)
+
+def _is_popular_cask_question(user_text: str) -> bool:
+    t = _normalize_text(user_text)
+    return ("חבית" in t or "cask" in t) and (("פופולר" in t) or ("הכי" in t) or ("most" in t) or ("popular" in t))
+
+def _try_fast_portfolio_answer(user_text: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+
+    t = str(user_text).lower()
+    if ("cask" in t or "חבית" in t or "חביות" in t) and ("popular" in t or "הכי" in t or "פופולר" in t):
+        if "casks_aged_in" not in df.columns:
+            return "אין עמודת casks_aged_in בנתונים."
+
+        df_rank = compute_cask_ranking(df)  # הפונקציה שלך שמחזירה df עם count
+        if df_rank is None or df_rank.empty:
+            return "לא מצאתי נתוני חביות."
+
+        return format_top_casks(df_rank)   # ✅ מחזיר טקסט, לא DF
+
+    return None
 
 # Pronouns / placeholders that usually mean: "the one we just talked about"
 _FOCUS_PRONOUNS = (
@@ -586,7 +781,7 @@ def _unique_from_array_col(df: pd.DataFrame, col: str) -> list[str]:
             for it in x:
                 if it is None:
                     continue
-            for tok in _normalize_to_list(it):
+            for tok in normalize_to_list(it):
                 if tok:
                     out.add(tok)
         else:
@@ -620,7 +815,7 @@ def _map_list_to_options(vals, options: list[str], threshold: float = 0.65, top_
 
     # אם זה מחרוזת - נסה לפרק לרשימה
     if isinstance(vals, str):
-        parts = _normalize_to_list(vals)  # הפונקציה שלך
+        parts = normalize_to_list(vals)  # הפונקציה שלך
         vals = parts
 
     out = []
@@ -848,9 +1043,9 @@ def _apply_controlled_vocab(scan: dict, active_df: pd.DataFrame) -> dict:
     out["origin_country"] = _map_to_closest(out.get("origin_country"), country_opts)
     out["region"] = _map_to_closest(out.get("region"), region_opts)
 
-    out["casks_aged_in"] = _map_list_to_options(_normalize_to_list(out.get("casks")), casks_opts)
-    out["nose"] = _map_list_to_options(_normalize_to_list(out.get("nose")), nose_opts)
-    out["palette"] = _map_list_to_options(_normalize_to_list(out.get("palate")), pal_opts)
+    out["casks_aged_in"] = _map_list_to_options(normalize_to_list(out.get("casks")), casks_opts)
+    out["nose"] = _map_list_to_options(normalize_to_list(out.get("nose")), nose_opts)
+    out["palette"] = _map_list_to_options(normalize_to_list(out.get("palate")), pal_opts)
 
     # normalize booleans
     out["special_bottling"] = bool(out.get("special"))
@@ -877,9 +1072,9 @@ def insert_new_bottle_from_payload(p: dict) -> int:
     val_country = _sql_str_or_null(p.get("origin_country"))
     val_region = _sql_str_or_null(p.get("region"))
 
-    val_casks = sql_array(_normalize_to_list(p.get("casks_aged_in")))
-    val_nose  = sql_array(_normalize_to_list(p.get("nose")))
-    val_pal   = sql_array(_normalize_to_list(p.get("palette")))
+    val_casks = sql_array(normalize_to_list(p.get("casks_aged_in")))
+    val_nose  = sql_array(normalize_to_list(p.get("nose")))
+    val_pal   = sql_array(normalize_to_list(p.get("palette")))
 
     age = p.get("age")
     abv = p.get("alcohol_percentage")
@@ -1040,8 +1235,8 @@ def execute_drink_update(bottle_id: int, amount_ml: int, inventory_dict: dict):
         SET stock_status_per = {new_stock_per},
             full_or_empy = {is_empty},
             updating_time = CURRENT_TIMESTAMP(),
-            nose = {sql_array(_normalize_to_list(f_nose))},
-            palette = {sql_array(_normalize_to_list(f_palette))},
+            nose = {sql_array(normalize_to_list(f_nose))},
+            palette = {sql_array(normalize_to_list(f_palette))},
             alcohol_percentage = {f_abv}
         WHERE bottle_id = {bottle_id};
 
@@ -1422,6 +1617,170 @@ def execute_df_query_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
 
     return sub.head(limit)
 
+
+def _df_to_telegram_text(df: pd.DataFrame, max_chars: int = 3500) -> str:
+    """Compact, safe formatting for Telegram."""
+    if df is None:
+        return ""
+    try:
+        if df.empty:
+            return "לא מצאתי תוצאות לפי הבקשה."
+
+        # If it's a single value -> return cleanly
+        if df.shape[0] == 1 and df.shape[1] == 1:
+            col = str(df.columns[0])
+            val = df.iloc[0, 0]
+            if pd.isna(val):
+                return f"{col}: -"
+            return f"{col}: {val}"
+
+        # If single row -> key/value list
+        if df.shape[0] == 1 and df.shape[1] <= 8:
+            r = df.iloc[0].to_dict()
+            lines = []
+            for k, v in r.items():
+                vv = "-" if pd.isna(v) else v
+                lines.append(f"{k}: {vv}")
+            out = "\n".join(lines)
+        else:
+            out = df.to_string(index=False)
+
+        out = out.strip()
+        if len(out) > max_chars:
+            out = out[: max_chars - 20].rstrip() + "\n... (truncated)"
+        return out
+    except Exception:
+        try:
+            out = df.to_string(index=False)
+            if len(out) > max_chars:
+                out = out[: max_chars - 20].rstrip() + "\n... (truncated)"
+            return out
+        except Exception:
+            return "לא הצלחתי להציג את התוצאה."
+
+# ===========================
+# Rule-based inventory Q&A (fast, deterministic)
+# ===========================
+
+_HEB_WINE = ("יין", "יינות")
+_HEB_WHISKY = ("וויסקי", "ויסקי")
+_HEB_RED = ("אדום", "אדומה")
+_HEB_WHITE = ("לבן", "לבנה")
+
+def _text_has_any(t: str, words) -> bool:
+    tt = _normalize_text(t)
+    return any(_normalize_text(w) in tt for w in words)
+
+def _is_count_bottles_question(t: str) -> bool:
+    tt = _normalize_text(t)
+    return ("כמה" in tt) and ("בקבוק" in tt or "בקבוקים" in tt)
+
+def _is_percent_of_total_question(t: str) -> bool:
+    tt = _normalize_text(t)
+    # covers: "מה אחוז X מכלל האלכוהול", "מה %", "מה היחס", "מתוך סה"כ"
+    return ("אחוז" in tt) or ("%" in t) or ("מכלל" in tt) or ("מתוך" in tt) or ("סהכ" in tt) or ('סה"כ' in t)
+
+def _filter_by_alcohol_type_keywords(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "alcohol_type" not in df.columns:
+        return df.iloc[0:0]
+    s = df["alcohol_type"].astype(str).fillna("").str.lower()
+    mask = False
+    for kw in keywords:
+        mask = mask | s.str.contains(kw, regex=False)
+    return df[mask].copy()
+
+def _infer_category_df(user_text: str, df: pd.DataFrame) -> tuple[str | None, pd.DataFrame]:
+    tt = _normalize_text(user_text)
+
+    # Whisky / whiskey family
+    if _text_has_any(tt, _HEB_WHISKY) or "whisky" in tt or "whiskey" in tt:
+        # Be generous: many datasets store "Single Malt Whisky", etc.
+        kws = ["whisky", "whiskey", "scotch", "bourbon", "rye", "single malt", "malt", "blended"]
+        return "וויסקי", _filter_by_alcohol_type_keywords(df, kws)
+
+    # Wine family
+    if _text_has_any(tt, _HEB_WINE) or "wine" in tt:
+        # red / white refinement
+        if _text_has_any(tt, _HEB_RED) or "red" in tt:
+            return "יין אדום", _filter_by_alcohol_type_keywords(df, ["red wine"])
+        if _text_has_any(tt, _HEB_WHITE) or "white" in tt:
+            return "יין לבן", _filter_by_alcohol_type_keywords(df, ["white wine"])
+        # generic wine (includes dessert, sparkling, etc.)
+        return "יין", _filter_by_alcohol_type_keywords(df, ["wine"])
+
+    return None, df.iloc[0:0]
+
+def _count_unique_bottles(df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    if "bottle_id" in df.columns:
+        return int(df["bottle_id"].nunique(dropna=True))
+    # fallback
+    return int(len(df))
+
+def rule_based_inventory_answer(user_text: str, df: pd.DataFrame) -> str | None:
+    """Deterministic answers for common portfolio inventory questions.
+    Returns a short Hebrew answer or None if not applicable.
+    """
+    if df is None or df.empty:
+        return None
+
+    if not _is_count_bottles_question(user_text) and not _is_percent_of_total_question(user_text):
+        return None
+
+    # ✅ NEW: if user asked "how many bottles of <X>" and <X> is NOT a category (wine/whisky),
+    # don't answer total; let the distillery matcher handle it.
+    ent = _normalize_text(_extract_entity_for_count(user_text) or "")
+    if ent:
+        is_whisky = ("וויסקי" in ent) or ("ויסקי" in ent) or ("whisky" in ent) or ("whiskey" in ent)
+        is_wine   = ("יין" in ent) or ("wine" in ent)
+        is_generic_total = ent in ("אלכוהול", "alcohol", "הכל", "כולם", "all", "total")
+
+        if (not is_whisky) and (not is_wine) and (not is_generic_total):
+            return None
+
+    label, sub = _infer_category_df(user_text, df)
+
+    # Total bottles question: "כמה בקבוקים יש לי" without specifying category
+    tt = _normalize_text(user_text)
+    if _is_count_bottles_question(user_text) and (label is None):
+        total = _count_unique_bottles(df)
+        return f"יש לך **{total}** בקבוקים בסך הכל."
+
+    # Category count
+    if _is_count_bottles_question(user_text) and label is not None:
+        cnt = _count_unique_bottles(sub)
+        return f"יש לך **{cnt}** בקבוקי {label}."
+
+    # Percent of total
+    if _is_percent_of_total_question(user_text) and label is not None:
+        total = _count_unique_bottles(df)
+        cnt = _count_unique_bottles(sub)
+        if total <= 0:
+            return "אין לי מספיק נתונים כדי לחשב אחוזים כרגע."
+        pct = round((cnt / total) * 100.0, 1)
+        return f"בקבוקי {label} הם **{pct}%** מכלל האלכוהול שלך (**{cnt}/{total}** בקבוקים)."
+
+    return None
+
+async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame) -> str | None:
+    """Use Gemini to build a strict df_query plan and execute it. Returns a user reply, or None."""
+    plan = gemini_make_df_query_plan(user_text, df)
+    if plan and isinstance(plan, dict):
+        try:
+            res = execute_df_query_plan(df, plan)
+            return _df_to_telegram_text(res)
+        except Exception as e:
+            logging.warning(f"DF plan execution failed: {e}")
+            # fall through to natural-language fallback
+    # final fallback: free text answer (still grounded by schema sample)
+    try:
+        return await gemini_fallback_answer(user_text, df)
+    except Exception as e:
+        logging.warning(f"Gemini fallback failed: {e}")
+        return None
 def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
     try:
         schema = build_df_schema_context(df)
@@ -1431,6 +1790,7 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
             "Return JSON ONLY.\n"
             "You MUST use only columns that exist in the provided schema.\n"
             "Never write SQL.\n"
+            "When the user asks how many bottles (or Hebrew equivalents like כמה בקבוקי/כמה בקבוקים), prefer counting UNIQUE bottles using nunique on bottle_id if that column exists.\n"
             "Allowed ops: eq, ne, lt, lte, gt, gte, contains, in, is_null, not_null.\n"
             "Allowed agg funcs: count, nunique, sum, avg, min, max.\n"
             "Limit must be between 1 and 50.\n"
@@ -1478,112 +1838,6 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
     
 _ALLOWED_OPS = {"eq","ne","lt","lte","gt","gte","contains","in","is_null","not_null"}
 _ALLOWED_AGG = {"count","nunique","sum","avg","min","max"}
-
-def execute_df_query_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
-    if df is None:
-        raise ValueError("DF is None")
-
-    cols = set(df.columns.tolist())
-
-    # limit
-    limit = int(plan.get("limit") or 10)
-    limit = max(1, min(limit, 50))
-
-    # select
-    select = plan.get("select") or []
-    if not isinstance(select, list):
-        select = []
-    select = [c for c in select if isinstance(c, str) and c in cols]
-
-    # filters
-    sub = df.copy()
-    filters_ = plan.get("filters") or []
-    if isinstance(filters_, list):
-        for f in filters_:
-            if not isinstance(f, dict):
-                continue
-            col = f.get("col")
-            op = f.get("op")
-            val = f.get("value", None)
-            if col not in cols or op not in _ALLOWED_OPS:
-                continue
-
-            s = sub[col]
-            if op == "is_null":
-                sub = sub[s.isna()]
-            elif op == "not_null":
-                sub = sub[s.notna()]
-            elif op == "contains":
-                sub = sub[s.astype(str).str.contains(str(val), case=False, na=False)]
-            elif op == "in":
-                if not isinstance(val, list):
-                    continue
-                sub = sub[s.isin(val)]
-            else:
-                # numeric-safe compare where possible
-                if op in {"lt","lte","gt","gte"}:
-                    left = pd.to_numeric(s, errors="coerce")
-                    right = pd.to_numeric(pd.Series([val]), errors="coerce").iloc[0]
-                    if pd.isna(right):
-                        continue
-                    if op == "lt":
-                        sub = sub[left < right]
-                    elif op == "lte":
-                        sub = sub[left <= right]
-                    elif op == "gt":
-                        sub = sub[left > right]
-                    else:
-                        sub = sub[left >= right]
-                else:
-                    # eq/ne as string compare fallback
-                    if op == "eq":
-                        sub = sub[s.astype(str) == str(val)]
-                    elif op == "ne":
-                        sub = sub[s.astype(str) != str(val)]
-
-    # groupby + aggregations
-    group_by = plan.get("group_by") or []
-    aggs = plan.get("aggregations") or []
-    if isinstance(group_by, list) and isinstance(aggs, list) and group_by and aggs:
-        gb_cols = [c for c in group_by if isinstance(c, str) and c in cols]
-        agg_dict = {}
-        agg_named = {}
-        for a in aggs:
-            if not isinstance(a, dict):
-                continue
-            func = a.get("func")
-            col = a.get("col")
-            alias = a.get("as") or f"{func}_{col}"
-            if func not in _ALLOWED_AGG:
-                continue
-
-            if col == "*" and func in {"count"}:
-                agg_named[alias] = ("bottle_id" if "bottle_id" in cols else df.columns[0], "count")
-            elif col in cols:
-                # map avg->mean
-                ffunc = "mean" if func == "avg" else func
-                agg_named[alias] = (col, ffunc)
-
-        if gb_cols and agg_named:
-            sub = sub.groupby(gb_cols, dropna=False).agg(**agg_named).reset_index()
-
-    # order_by
-    order_by = plan.get("order_by") or []
-    if isinstance(order_by, list) and order_by:
-        ob = order_by[0] if order_by else {}
-        c = ob.get("col")
-        d = (ob.get("direction") or "asc").lower()
-        if c in sub.columns:
-            sub = sub.sort_values(c, ascending=(d != "desc"))
-
-    # final select
-    if select:
-        # keep only existing
-        keep = [c for c in select if c in sub.columns]
-        if keep:
-            sub = sub[keep]
-
-    return sub.head(limit)
 
     
 
@@ -1674,6 +1928,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If we're waiting for a label photo, accept PHOTO messages
     if stage == "await_label_photo":
+        # Allow cancel even while waiting for a photo
+        _t = ""
+        if update.message:
+            _t = update.message.text or update.message.caption or ""
+        if _normalize_text(_t) in [_normalize_text(x) for x in _CANCEL_WORDS]:
+            context.user_data.pop("pending_update", None)
+            context.user_data.pop("pending_count", None)
+            context.user_data.pop("pending_stock", None)
+            _clear_add_flow(context)
+            await update.message.reply_text("סבבה, ביטלתי. שלח שאלה חדשה 🙂")
+            return
         if update.message and update.message.photo:
             try:
                 photo = update.message.photo[-1]  # highest resolution
@@ -2100,7 +2365,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("לא הצלחתי לזהות את הבקבוק. תן עוד קצת פרטים (מזקקה + שם/גיל).")
             return
+        
+        
+    df = get_all_data_as_df()
+    if df is None:
+        df = pd.DataFrame()
 
+    fast = _try_fast_portfolio_answer(user_text, df)
+    if fast:
+        await update.message.reply_text(fast)
+        return
+    
     # 2) Fresh data for deterministic intents
     try:
         df = get_all_data_as_df()
@@ -2109,6 +2384,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # build inventory dict once when needed
 
         # 2) Analytics / research questions (no Gemini)
+
+        # Smart analytics via Gemini DF planner (portfolio shares, flexible ratios, etc.)
+        # We route percent-of-total questions here to avoid confusing them with "remaining stock" bottle questions.
+        if _looks_like_portfolio_share_query(user_text):
+            reply = await try_gemini_df_query_answer(user_text, df)
+            if reply:
+                await update.message.reply_text(reply)
+                return
+
         if _looks_like_popular_query(user_text):
             # Flexible scope via Gemini planner (e.g., "most popular of M&H")
             plan = gemini_make_plan(user_text, active_df)
@@ -2354,49 +2638,134 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         inventory_dict = None
 
-        # 2a) Count query: fuzzy distillery
-        if _looks_like_count_query(user_text):
-            ent = _extract_entity_for_count(user_text)
-            if not ent:
-                await update.message.reply_text("על איזה מזקקה? למשל: 'כמה בקבוקי Glenfiddich יש לי'")
+        # -----------------------------
+        # HAVE QUERY (YES/NO)
+        # -----------------------------
+        if _looks_like_have_query(user_text):
+            term = _extract_entity_for_have(user_text).strip()
+            if not term:
+                await update.message.reply_text("מה לחפש? למשל: 'האם יש לי Glenfiddich 15?'")
                 return
 
-            dist_match = find_best_distillery_match(ent, active_df)
-            if not dist_match["best"] or dist_match["score"] < 0.62:
-                # propose top 3
-                cands = dist_match["candidates"][:3]
-                if not cands:
-                    await update.message.reply_text("לא מצאתי מזקקה דומה במלאי הפעיל.")
-                    return
-                lines = [f"{i+1}. {c['distillery']} (score {c['score']})" for i, c in enumerate(cands)]
+            # First: bottle match (best for specific editions like "Project XX")
+            m = find_best_bottle_match(term, active_df)
+            best_name = m.get("best_name")
+            best_score = float(m.get("score") or 0)
+
+            if best_name and best_score >= 0.78 and _token_overlap_ok(term, best_name, min_overlap=0.70):
+                await update.message.reply_text(f"כן 🙂 יש לך את:\n✅ {best_name}")
+                return
+
+            cands = (m.get("candidates") or [])[:5]
+            if cands:
+                lines = [f"{i+1}. {c.get('full_name')} (score {c.get('score')})" for i, c in enumerate(cands)]
                 await update.message.reply_text(
-                    "לא הייתי בטוח לאיזה מזקקה התכוונת.\n"
-                    "תכתוב את השם המדויק יותר, או בחר אחד:\n" + "\n".join(lines)
+                    "לא הייתי בטוח שהתכוונת בדיוק לזה. מצאתי כמה קרובים:\n" + "\n".join(lines) +
+                    "\n\nתענה במספר (1-5) או תכתוב את השם המדויק."
+                )
+                return
+            
+            
+            # Second: distillery match (best for 'm&h', 'glendiffich' typos, etc.)
+            dm = find_best_distillery_match(term, active_df)
+            best_dist = dm.get("best")
+            dist_score = float(dm.get("score") or 0)
+
+            if best_dist and dist_score >= 0.72:
+                sub = active_df[active_df["distillery"].astype(str) == str(best_dist)]
+                cnt = int(sub["bottle_id"].nunique())
+                if cnt > 0:
+                    await update.message.reply_text(f"כן 🙂 יש לך **{cnt}** בקבוקים פעילים של {best_dist}.")
+                else:
+                    await update.message.reply_text(f"לא. אין לך כרגע בקבוקים פעילים של {best_dist}.")
+                return
+
+            # Not confident -> propose top candidates (bottle)
+            cands = (m.get("candidates") or [])[:3]
+            if cands:
+                lines = [f"{i+1}. {c.get('full_name')} (score {c.get('score')})" for i, c in enumerate(cands)]
+                await update.message.reply_text(
+                    "לא הייתי בטוח למה התכוונת. יכול להיות שהתכוונת לאחד מאלה?\n" + "\n".join(lines)
                 )
                 return
 
-            dist = dist_match["best"]
-            sub = active_df[active_df["distillery"].astype(str) == str(dist)]
-            cnt = int(sub["bottle_id"].nunique())
-            # show a compact list of bottles (optional, helpful)
-            sample = (
-                sub["bottle_name"]
-                .dropna()
-                .astype(str)
-                .value_counts()
-                .head(8)
-            )
-            if sample.empty:
-                await update.message.reply_text(f"יש לך {cnt} בקבוקים פעילים של {dist}.")
+            await update.message.reply_text("לא מצאתי התאמה במלאי הפעיל. נסה לכתוב מזקקה + שם/גיל 🙂")
+            return
+
+        # -----------------------------
+        # PERCENT / SHARE QUERIES (must run even without "כמה")
+        # -----------------------------
+        if _is_percent_of_total_question(user_text) or _looks_like_portfolio_share_query(user_text):
+            rb = rule_based_inventory_answer(user_text, df)
+            if rb:
+                await update.message.reply_text(rb)
                 return
 
-            details = "\n".join([f"• {name} ×{int(n)}" for name, n in sample.items()])
-            more = ""
-            if cnt > 8:
-                more = f"\n(+ עוד {cnt - 8} נוספים)"
-            await update.message.reply_text(
-                f"יש לך {cnt} בקבוקים פעילים של {dist}.\n\n{details}{more}")
-            return
+            # If RB couldn't infer category, try Gemini DF planner as fallback
+            reply = await try_gemini_df_query_answer(user_text, df)
+            if reply:
+                await update.message.reply_text(reply)
+                return
+        # -----------------------------
+        # COUNT ROUTING (FIXED ORDER)
+        # -----------------------------
+        if _looks_like_count_query(user_text):
+            # 0) Deterministic inventory Q&A first (category/total/percent, etc.)
+            rb = rule_based_inventory_answer(user_text, df)
+            if rb:
+                await update.message.reply_text(rb)
+                return
+
+            # 1) Try fuzzy-distillery count ONLY if entity exists and match is strong.
+            #    This prevents "וויסקי/יין/אלכוהול" from triggering distillery prompts.
+            # 1) Fuzzy distillery count when user provided an entity (m&h / Glenfiddich / etc.)
+            ent = _extract_entity_for_count(user_text).strip()
+            if ent:
+                dist_match = find_best_distillery_match(ent, active_df)
+                best_dist = dist_match.get("best")
+                score = float(dist_match.get("score") or 0)
+
+                # ✅ v13-like threshold (more forgiving)
+                if (not best_dist) or (score < 0.62):
+                    cands = (dist_match.get("candidates") or [])[:3]
+                    if not cands:
+                        await update.message.reply_text("לא מצאתי מזקקה דומה במלאי הפעיל.")
+                        return
+                    lines = [f"{i+1}. {c['distillery']} (score {c['score']})" for i, c in enumerate(cands)]
+                    await update.message.reply_text(
+                        "לא הייתי בטוח לאיזו מזקקה התכוונת.\n"
+                        "תכתוב שם מדויק יותר או בחר אחד:\n" + "\n".join(lines)
+                    )
+                    return
+
+                # confident -> answer
+                sub = active_df[active_df["distillery"].astype(str) == str(best_dist)]
+                cnt = int(sub["bottle_id"].nunique())
+
+                sample = (
+                    sub["bottle_name"]
+                    .dropna()
+                    .astype(str)
+                    .value_counts()
+                    .head(8)
+                )
+
+                if sample.empty:
+                    await update.message.reply_text(f"יש לך {cnt} בקבוקים פעילים של {best_dist}.")
+                    return
+
+                details = "\n".join([f"• {name} ×{int(n)}" for name, n in sample.items()])
+                more = f"\n(+ עוד {cnt - 8} נוספים)" if cnt > 8 else ""
+                await update.message.reply_text(
+                    f"יש לך {cnt} בקבוקים פעילים של {best_dist}.\n\n{details}{more}"
+                )
+                return
+
+            # 2) Otherwise, Gemini DF planner for flexible analytics
+            reply = await try_gemini_df_query_answer(user_text, df)
+            if reply:
+                await update.message.reply_text(reply)
+                return
 
         # 2b) Update query: fuzzy bottle + confirmation when not exact
         if _looks_like_update(user_text):
@@ -2466,11 +2835,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
             return
         
-
+        fast = _try_fast_portfolio_answer(user_text, active_df)
+        if fast:
+            await update.message.reply_text(fast)
+            return
 
         # --- Fallback: free text -> df query plan via Gemini ---
         df = get_all_data_as_df()
         active_df = df[df["stock_status_per"] > 0].copy()
+        
 
         # ---- Gemini Router ----
         route = gemini_route(user_text, df)
@@ -2483,21 +2856,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             r = (route.get("route") or "").lower()
 
-            if r == "df_query":
-                plan = route.get("df_plan") or {}
-                try:
-                    res = execute_df_query_plan(df, plan)
-                    if res.empty:
-                        await update.message.reply_text("לא מצאתי תוצאות לפי הבקשה.")
-                    else:
-                        await update.message.reply_text(res.to_string(index=False))
-                except Exception as e:
-                    logging.exception(e)
-                    await update.message.reply_text(f"שגיאה בהרצת השאילתה: {e}")
+        if r == "df_query":
+            plan = route.get("df_plan") or {}
+            try:
+                res = execute_df_query_plan(df, plan)
+
+                # ---------- A) אם execute_df_query_plan מחזיר טקסט (STRING) ----------
+                # זה בדיוק המקרה שהראית: מופיעים "\\n" בתוך ההודעה
+                if isinstance(res, str):
+                    formatted_text = res.replace("\\n", "\n")
+
+                    if len(formatted_text) > 4000:
+                        formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
+
+                    # אם זה טקסט שכבר "מפורמט" - אל תכריח Markdown
+                    await update.message.reply_text(formatted_text)
+                    return
+
+                # ---------- B) אם אין תוצאות (רלוונטי רק ל-DataFrame/Series) ----------
+                if hasattr(res, "empty") and res.empty:
+                    await update.message.reply_text("לא מצאתי תוצאות לפי הבקשה.")
+                    return
+
+                # ---------- C) זיהוי אם המשתמש שאל על חביות ----------
+                txt = (user_text or "")
+                user_asked_casks = ("חבית" in txt) or ("חביות" in txt) or ("cask" in txt.lower())
+
+                # ---------- D) חביות: סופרים ידנית מתוך df המקורי ----------
+                # (כי בטבלה המקורית אין "count")
+                if user_asked_casks and "casks_aged_in" in df.columns:
+                    ranking = (
+                        df["casks_aged_in"]
+                        .dropna()
+                        .astype(str)
+                        .value_counts()
+                        .reset_index()
+                    )
+                    ranking.columns = ["casks_aged_in", "count"]
+
+                    formatted_text = format_top_casks(ranking)
+
+                    if len(formatted_text) > 4000:
+                        formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
+
+                    await update.message.reply_text(formatted_text, parse_mode="Markdown")
+                    return
+
+                # ---------- E) ברירת מחדל: פורמט רגיל ----------
+                formatted_text = format_result(res)
+
+                if len(formatted_text) > 4000:
+                    formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
+
+                await update.message.reply_text(formatted_text, parse_mode="Markdown")
                 return
 
-            if r == "smalltalk":
-                await update.message.reply_text("יאללה 🙂 איך אני יכול לעזור עם האוסף שלך?")
+            except Exception as e:
+                await update.message.reply_text(f"שגיאה בהרצת השאילתה: {e}")
                 return
 
 
@@ -2528,7 +2943,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Whisky Telegram agent running (deterministic fuzzy inventory + confirmation updates)...")
+
+
+    print("Whisky Telegram agent running (deterministic fuzzy inventory + Gemini DF analytics fallback)...")
     application.run_polling()
