@@ -49,6 +49,197 @@ bq_client = bigquery.Client.from_service_account_json(SERVICE_ACCOUNT_FILE, proj
 # ==========================================
 CACHE_DATA = {"df": None, "last_update": 0}
 
+SWEETNESS_RANGES = {
+    'Very Sweet': (0, 1.5),
+    'Sweet-Citrucy': (1.51, 2.0),
+    'Citrucy-Spicy': (2.01, 2.749),
+    'Coffee Like- Sea Salt': (2.75, 4.0),
+    'Minerals - Sulfur': (4.01, 5.5),
+    'Ash - BBQ Smoke': (5.51, 7.5),
+    'Heavy Peat - Medicinal Smoke': (7.51, 100.0)
+}
+
+RICHNESS_RANGES = {
+    'Very Watery': (0, 3.0),
+    'Very Delicate': (3.01, 5.3),
+    'Delicate': (5.31, 8.0),
+    'Full Body': (8.01, 10.2),
+    'Rich': (10.21, 12.5),
+    'Very Rich': (12.51, 17.5),
+    'Syrup Like': (17.51, 100.0)
+}
+
+import re
+
+def _is_extremes_question(text: str) -> bool:
+    """
+    Only 'מה הכי ...' style questions.
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    return bool(re.search(r"\bהכי\b", t)) and bool(re.search(r"(מתוק|מעושן|עשן|עדין|עשיר|סמיך|כבד|מלא)", t))
+
+def _is_focus_flavor_question(text: str) -> bool:
+    """
+    Bottle-specific follow-ups like:
+    - כמה מתוק הוא?
+    - האם הוא עדין?
+    - הוא עשיר?
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    return bool(re.search(r"(כמה\s*(הוא)?\s*(מתוק|מעושן|עדין|עשיר|סמיך)|האם\s*הוא\s*(מתוק|מעושן|עדין|עשיר|סמיך)|\bהוא\b\s*(מתוק|מעושן|עדין|עשיר|סמיך)|מתוק\?|מעושן\?|עדין\?|עשיר\?|סמיך\?)", t))
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _label_from_ranges(score: float, ranges_dict: dict) -> str:
+    """
+    Returns label from dict like {label: (low, high)} inclusive bounds.
+    """
+    if score is None:
+        return "Unknown"
+    try:
+        v = float(score)
+    except Exception:
+        return "Unknown"
+
+    for label, (low, high) in ranges_dict.items():
+        if float(low) <= v <= float(high):
+            return label
+    return "Out of Range"
+
+def _safe_float(x):
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v):
+        return None
+    return float(v)
+
+def resolve_bottle_row_from_text(user_text: str, df: pd.DataFrame, last_bottle_id: int | None) -> pd.Series | None:
+    """
+    Resolve a bottle row using:
+    1) Pronoun reference (הוא/זה/בו/אותו/עליו...) -> last_bottle_id
+    2) Exact/substring match on bottle_name
+    3) Distillery match (fallback: pick first bottle from that distillery)
+    """
+    if df is None or df.empty:
+        return None
+
+    t = _normalize_text(user_text)
+
+    # (1) Pronoun / implicit reference -> last bottle
+    if re.search(r"\b(הוא|זה|בו|בה|אותו|אותה|עליו|עליה)\b", t) and last_bottle_id:
+        if "bottle_id" in df.columns:
+            hit = df[df["bottle_id"].astype(str) == str(last_bottle_id)]
+            if not hit.empty:
+                return hit.iloc[0]
+
+    # (2) Bottle name mention
+    if "bottle_name" in df.columns:
+        names = df["bottle_name"].dropna().astype(str).unique().tolist()
+        # longest-first helps when one name contains another
+        names = sorted(names, key=lambda x: len(_normalize_text(x)), reverse=True)
+        for name in names:
+            n = _normalize_text(name)
+            if n and n in t:
+                hit = df[df["bottle_name"].astype(str) == str(name)]
+                if not hit.empty:
+                    return hit.iloc[0]
+
+    # (3) Distillery mention fallback
+    if "distillery" in df.columns:
+        dists = df["distillery"].dropna().astype(str).unique().tolist()
+        dists = sorted(dists, key=lambda x: len(_normalize_text(x)), reverse=True)
+        for dist in dists:
+            d = _normalize_text(dist)
+            if d and d in t:
+                hit = df[df["distillery"].astype(str) == str(dist)]
+                if not hit.empty:
+                    return hit.iloc[0]
+
+    return None
+
+def try_handle_focus_bottle_flavor_questions(
+    user_text: str,
+    active_df: pd.DataFrame,
+    context: ContextTypes.DEFAULT_TYPE
+) -> str | None:
+    """
+    Answers bottle-specific questions about sweetness/smokiness and delicacy/richness.
+    Uses your focus bottle mechanism:
+      - First tries _get_focus_bottle_row(active_df, context)
+      - If no focus, tries to detect bottle from text and then _set_focus_bottle(context, row)
+
+    Recognizes:
+      - מתוק/מעושן
+      - עדין/עשיר/סמיך
+      - "כמה הוא ..." / "הוא ..." / "...?" phrasing
+    """
+    if not user_text:
+        return None
+
+    t = _normalize_text(user_text)
+
+    ask_sweet_smoky = bool(re.search(r"(כמה\s*הוא\s*מתוק|כמה\s*הוא\s*מעושן|הוא\s*מתוק|הוא\s*מעושן|מתוק\?|מעושן\?)", t))
+    ask_richness    = bool(re.search(r"(כמה\s*הוא\s*עדין|כמה\s*הוא\s*עשיר|הוא\s*עדין|הוא\s*עשיר|עדין\?|עשיר\?|סמיך\?)", t))
+
+    if not (ask_sweet_smoky or ask_richness):
+        return None
+
+    # 1) Try focus bottle
+    row = _get_focus_bottle_row(active_df, context)
+
+    # 2) If no focus, try to resolve from text and set focus
+    if row is None:
+        row = find_best_bottle_match(user_text, active_df )
+        if row is None:
+            return "על איזה בקבוק מדובר? תכתוב שם בקבוק/מזקקה, או תשאל קודם שאלה שמחזירה בקבוק ואז תגיד 'הוא מתוק?'"
+        _set_focus_bottle(context, row)
+
+    dist = str(row.get("distillery") or "-")
+    bottle = str(row.get("bottle_name") or row.get("full_name") or "-")
+
+    sep = "━━━━━━━━━━━━━━━━━━"
+    out = [
+        f"{sep}\n🧾 פרופיל בקבוק\n{sep}\n\n"
+        f"{dist} – {bottle}\n"
+    ]
+
+    if ask_sweet_smoky:
+        if "final_smoky_sweet_score" not in row.index:
+            out.append("\n⚠️ אין לי final_smoky_sweet_score לבקבוק הזה.")
+        else:
+            s_val = _safe_float(row.get("final_smoky_sweet_score"))
+            if s_val is None:
+                out.append("\n⚠️ אין ערך תקין למדד מתוק↔עשן לבקבוק הזה.")
+            else:
+                label = _label_from_ranges(s_val, SWEETNESS_RANGES)
+                out.append(
+                    f"\n🍯 מתוק↔עשן: {s_val:.2f}\n"
+                    f"🏷️ פרופיל: {label}\n"
+                    "ℹ️ נמוך=יותר מתוק · גבוה=יותר מעושן"
+                )
+
+    if ask_richness:
+        if "final_richness_score" not in row.index:
+            out.append("\n⚠️ אין לי final_richness_score לבקבוק הזה.")
+        else:
+            r_val = _safe_float(row.get("final_richness_score"))
+            if r_val is None:
+                out.append("\n⚠️ אין ערך תקין למדד עדין↔עשיר לבקבוק הזה.")
+            else:
+                label = _label_from_ranges(r_val, RICHNESS_RANGES)
+                out.append(
+                    f"\n\n🌿 עדין↔עשיר: {r_val:.2f}\n"
+                    f"🏷️ פרופיל: {label}\n"
+                    "ℹ️ נמוך=יותר עדין · גבוה=יותר עשיר"
+                )
+
+    return "".join(out).strip()
+
 def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     global CACHE_DATA
     if (
@@ -418,6 +609,153 @@ def _looks_like_count_query(text: str) -> bool:
     t = _normalize_text(text)
     return any(h in t for h in _COUNT_HINTS) and (any(h in t for h in _BOTTLE_HINTS) or any(h in t for h in _HAVE_HINTS))
 
+import re
+import pandas as pd
+
+def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFrame) -> str | None:
+    """
+    Handles deterministic Q&A for:
+    - sweetest / smokiest based on final_smoky_sweet_score (0-20)
+    - most delicate / richest based on final_richness_score (0-30)
+
+    Rules:
+      final_smoky_sweet_score (0..20): low=sweeter, high=smokier
+      final_richness_score   (0..30): low=more delicate, high=richer
+    """
+    if not user_text:
+        return None
+
+    t = user_text.strip().lower()
+
+    # --- intent detection (Hebrew-focused) ---
+    want_sweetest = bool(re.search(r"הכי\s*מתוק", t))
+    want_smokiest = bool(re.search(r"הכי\s*מעושן|הכי\s*עשן|הכי\s*מעשן", t))
+    want_delicate = bool(re.search(r"הכי\s*עדין|הכי\s*קליל|הכי\s*רך", t))
+    want_richest  = bool(re.search(r"הכי\s*עשיר|הכי\s*סמיך|הכי\s*כבד|הכי\s*מלא", t))
+
+    if not any([want_sweetest, want_smokiest, want_delicate, want_richest]):
+        return None
+
+    if df is None or df.empty:
+        return "אין לי נתונים כרגע כדי לחשב את זה."
+
+    # Optional: filter active bottles if stock_status_per exists
+    sub = df[df["alcohol_type"].isin([
+        "Single Malt Whisky",
+        "Blended Scotch Whisky"
+    ])].copy()
+    all_series = sub["final_smoky_sweet_score"]
+    all_series_richness = sub["final_richness_score"]
+    if "stock_status_per" in sub.columns:
+        sub = sub[pd.to_numeric(sub["stock_status_per"], errors="coerce").fillna(0) > 0]
+
+    def _top_rows(score_col: str, ascending: bool, k: int = 3):
+        if score_col not in sub.columns:
+            return None, f"לא מצאתי את העמודה {score_col} בטבלה."
+
+        s = sub.copy()
+        s[score_col] = pd.to_numeric(s[score_col], errors="coerce")
+        s = s.dropna(subset=[score_col])
+
+        if s.empty:
+            return None, f"אין ערכים תקינים בעמודה {score_col} כדי לבחור קצה סקאלה."
+
+        s = s.sort_values(by=score_col, ascending=ascending)
+        return s.head(k), None
+
+    def _fmt_line(i: int, dist: str, bottle: str, score: float, max_score: int) -> str:
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+        dist = (dist or "-").strip()
+        bottle = (bottle or "-").strip()
+        return f"{medal} {dist} – {bottle}  ·  {score:.2f}/{max_score}"
+
+    def _pretty_top3(title: str, metric_label: str, max_score: int, hint: str, rows: pd.DataFrame, score_col: str, all_series: pd.Series, richness: pd.Series) -> str:
+        sep = "━━━━━━━━━━━━━━━━━━"
+        lines = []
+        n = min(3, len(rows))
+        for idx in range(n):
+            r = rows.iloc[idx]
+            score = float(r.get(score_col))
+            lines.append(_fmt_line(idx + 1, str(r.get("distillery", "-")), str(r.get("bottle_name", "-")), score, max_score))
+
+        avg = float(pd.to_numeric(all_series, errors="coerce").dropna().mean()) if all_series is not None else None
+        avg_richness = float(pd.to_numeric(richness, errors="coerce").dropna().mean()) if richness is not None else None
+        avg_line = (
+    f"📌 ממוצע מתיקות: {avg:.2f} / {max_score}\n"
+    f"📌 ממוצע סמיכות: {avg_richness:.2f} / {max_score}\n"
+) 
+
+        return (
+            f"{sep}\n"
+            f"{title}\n"
+            f"{sep}\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + f"📊 {metric_label} (טופ {n})\n"
+            + avg_line
+            + hint
+        )
+
+    # --- Decide which extreme to compute (Top 3) ---
+
+    if want_sweetest:
+        rows, err = _top_rows("final_smoky_sweet_score", ascending=True, k=3)  # low = sweetest
+        if err:
+            return err
+        
+       
+        return _pretty_top3(
+            title="🍯 טופ 3 הבקבוקים הכי מתוקים אצלך",
+            metric_label="מדד מתוק↔עשן",
+            max_score=12,
+            hint="🟢 נמוך יותר = מתוק יותר",
+            rows=rows,
+            score_col="final_smoky_sweet_score", all_series=all_series, richness=all_series_richness
+        )
+
+    if want_smokiest:
+        rows, err = _top_rows("final_smoky_sweet_score", ascending=False, k=3)  # high = smokiest
+        if err:
+            return err
+       
+        return _pretty_top3(
+            title="🔥 טופ 3 הבקבוקים הכי מעושנים אצלך",
+            metric_label="מדד מתוק↔עשן",
+            max_score=12,
+            hint="🟠 גבוה יותר = מעושן יותר",
+            rows=rows,
+            score_col="final_smoky_sweet_score", all_series=all_series, richness=all_series_richness
+        )
+
+    if want_delicate:
+        rows, err = _top_rows("final_richness_score", ascending=True, k=3)  # low = most delicate
+        if err:
+            return err
+        
+        return _pretty_top3(
+            title="🌿 טופ 3 הבקבוקים הכי עדינים אצלך",
+            metric_label="מדד עדין↔עשיר",
+            max_score=30,
+            hint="🟢 נמוך יותר = עדין יותר",
+            rows=rows,
+            score_col="final_richness_score", all_series=all_series, richness=all_series_richness
+        )
+
+    if want_richest:
+        rows, err = _top_rows("final_richness_score", ascending=False, k=3)  # high = richest
+        if err:
+            return err
+       
+        return _pretty_top3(
+            title="🥃 טופ 3 הבקבוקים הכי עשירים/סמיכים אצלך",
+            metric_label="מדד עדין↔עשיר",
+            max_score=30,
+            hint="🟠 גבוה יותר = עשיר יותר",
+            rows=rows,
+            score_col="final_richness_score", all_series=all_series, richness=all_series_richness
+        )
+
+    return None
 
 def _looks_like_have_query(text: str) -> bool:
     """
@@ -428,6 +766,188 @@ def _looks_like_have_query(text: str) -> bool:
     if any(h in t for h in _COUNT_HINTS):
         return False
     return any(h in t for h in _HAVE_HINTS)
+
+def _looks_like_flavors_of_bottle_query(text: str) -> bool:
+    t = _normalize_text(text)
+    # "טעמים/ארומות/נוז/פלטה" – אבל לא "הכי פופולרי"
+    if any(h in t for h in _POPULAR_HINTS):
+        return False
+    return any(k in t for k in (
+        "מה הטעמים", "טעמים", "טעם", "ארומות", "ארומה",
+        "nose", "palate", "palette", "פרופיל טעם", "פרופיל הטעם"
+    ))
+
+def _looks_like_casks_of_bottle_query(text: str) -> bool:
+    # אם זה "פופולרי" → זה לא “איזה חבית הוא”, זה דירוג כללי
+    if _is_popular_cask_question(text) or _looks_like_popular_query(text):
+        return False
+    t = _normalize_text(text)
+    has_cask = ("חבית" in t) or ("חביות" in t) or ("cask" in t)
+    # ניסוחים טיפוסיים של "איזה חבית הוא"
+    has_which = ("איזה" in t) or ("מה" in t) or ("שלו" in t) or ("של" in t) or ("aged" in t)
+    return has_cask and has_which
+
+def _looks_like_age_of_bottle_query(text: str) -> bool:
+    t = _normalize_text(text)
+    # גיל / שנים / בן כמה / age / aged
+    return any(k in t for k in ("גיל", "בן כמה", "כמה שנים", "age", "aged"))
+
+
+def build_age_reply(row) -> str:
+    full_name = str(row.get("full_name") or "").strip()
+    age = row.get("age")
+
+    # נורמליזציה
+    try:
+        if age is None or (isinstance(age, float) and pd.isna(age)) or str(age).strip() == "":
+            age_txt = "לא מוגדר לי גיל לבקבוק הזה."
+        else:
+            age_int = int(float(age))
+            age_txt = f"{age_int} שנים"
+    except Exception:
+        age_txt = f"{str(age).strip()}"
+
+    return (
+        f"🎂 *הגיל של הוויסקי:*\n"
+        f"🥃 *{full_name}*\n"
+        f"{age_txt}"
+    )
+    
+    
+def _repair_broken_phrase_items(items: list[str]) -> list[str]:
+    """
+    Merge adjacent list items when the next item looks like a continuation
+    (e.g., starts with lowercase): ['Pedro Xime','ez Sherry'] -> ['Pedro Ximenez Sherry']
+    """
+    if not items:
+        return []
+
+    raw = [str(x).strip() for x in items if str(x).strip()]
+    merged = []
+    i = 0
+
+    while i < len(raw):
+        cur = raw[i]
+
+        # while next looks like continuation (starts with lowercase)
+        while i + 1 < len(raw):
+            nxt = raw[i + 1].strip()
+            if not nxt:
+                i += 1
+                continue
+
+            if nxt and nxt[0].islower():
+                # join without extra space (continuation of a broken word)
+                cur = cur + nxt
+                i += 1
+                continue
+
+            break
+
+        merged.append(cur)
+        i += 1
+
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for x in merged:
+        k = x.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+
+    return out
+
+
+def _camel_to_words(text: str) -> list[str]:
+    """
+    'BerriesSherryCaramelHoneyVanilla' -> ['Berries','Sherry','Caramel','Honey','Vanilla']
+    Also supports: '...Vanilla Smoke' -> adds 'Smoke' properly.
+    """
+    if not text:
+        return []
+
+    t = str(text).strip()
+    t = t.replace("\u200f", " ").replace("\u200e", " ")
+    t = re.sub(r"\s+", " ", t)
+
+    words = []
+    for chunk in t.split(" "):
+        if not chunk:
+            continue
+        # Extract CamelCase words; fallback to the chunk itself if no matches
+        found = re.findall(r"[A-Z][a-z]+", chunk)
+        if found:
+            words.extend(found)
+        else:
+            words.append(chunk)
+
+    # Merge Light Smoke if you ever get that (optional)
+    merged = []
+    i = 0
+    while i < len(words):
+        if i + 1 < len(words) and words[i] == "Light" and words[i+1] == "Smoke":
+            merged.append("Light Smoke")
+            i += 2
+        else:
+            merged.append(words[i])
+            i += 1
+
+    return merged
+
+
+def _as_bullets(items: list[str]) -> str:
+    if not items:
+        return "• -"
+    return "\n".join([f"• {x}" for x in items])
+
+
+def build_flavors_reply(row) -> str:
+    full_name = str(row.get("full_name") or "").strip()
+
+    nose_raw = normalize_to_list(row.get("nose"))
+    pal_raw  = normalize_to_list(row.get("palette"))
+
+    # Sometimes it's a single concatenated string inside a list
+    nose_text = " ".join([str(x).strip() for x in (nose_raw or []) if str(x).strip()])
+    pal_text  = " ".join([str(x).strip() for x in (pal_raw or []) if str(x).strip()])
+
+    nose_words = _camel_to_words(nose_text)
+    pal_words  = _camel_to_words(pal_text)
+
+    nose_out = ", ".join(nose_words) if nose_words else "-"
+    pal_out  = ", ".join(pal_words) if pal_words else "-"
+
+    return (
+        f"👃 *Nose* של הבקבוק:\n"
+        f"🥃 *{full_name}*\n"
+        f"{nose_out}\n\n"
+        f"👅 *Palate* של הבקבוק:\n"
+        f"🥃 *{full_name}*\n"
+        f"{pal_out}"
+    )
+
+def build_casks_reply(row) -> str:
+    full_name = str(row.get("full_name") or "").strip()
+
+    # raw list
+    casks_raw = normalize_to_list(row.get("casks_aged_in"))
+
+    # ✅ repair broken items (like Xime + ez Sherry)
+    casks_fixed = _repair_broken_phrase_items(casks_raw or [])
+
+    # אם לפעמים זה מגיע כמחרוזת אחת עם פסיקים, תפצל רק על פסיקים/נקודה-פסיק/|
+    if len(casks_fixed) == 1 and any(sep in casks_fixed[0] for sep in [",", ";", "|"]):
+        parts = re.split(r"[;,|]\s*", casks_fixed[0])
+        casks_fixed = [p.strip() for p in parts if p.strip()]
+
+    bullets = _as_bullets(casks_fixed)
+
+    return (
+        f"🪵 *חביות (casks_aged_in):*\n"
+        f"🥃 *{full_name}*\n"
+        f"{bullets}"
+    )
 
 def _extract_entity_for_have(text: str) -> str:
     """
@@ -1350,7 +1870,35 @@ def gemini_make_plan(user_text: str, active_df: pd.DataFrame) -> dict | None:
     except Exception as e:
         logging.warning(f"Gemini planner failed: {e}")
         return None
-    
+
+# ---- DF schema context ----
+def build_df_schema_context(df: pd.DataFrame, max_examples: int = 12) -> dict:
+    ctx = {"columns": []}
+    if df is None or df.empty:
+        return ctx
+
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        entry = {"name": col, "dtype": dtype}
+
+        # small examples for object cols (helps Gemini choose filters)
+        if dtype == "object":
+            vals = (
+                df[col]
+                .dropna()
+                .astype(str)
+                .map(lambda x: x.strip())
+                .loc[lambda s: s != ""]
+                .unique()
+                .tolist()
+            )
+            if vals:
+                entry["examples"] = vals[:max_examples]
+
+        ctx["columns"].append(entry)
+
+    return ctx
+
 # ==========================================
 # Gemini Hard Fallback (free text answer)
 # ==========================================
@@ -1409,33 +1957,7 @@ import json
 import re
 import pandas as pd
 
-# ---- DF schema context ----
-def build_df_schema_context(df: pd.DataFrame, max_examples: int = 12) -> dict:
-    ctx = {"columns": []}
-    if df is None or df.empty:
-        return ctx
 
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        entry = {"name": col, "dtype": dtype}
-
-        # small examples for object cols (helps Gemini choose filters)
-        if dtype == "object":
-            vals = (
-                df[col]
-                .dropna()
-                .astype(str)
-                .map(lambda x: x.strip())
-                .loc[lambda s: s != ""]
-                .unique()
-                .tolist()
-            )
-            if vals:
-                entry["examples"] = vals[:max_examples]
-
-        ctx["columns"].append(entry)
-
-    return ctx
 
 
 # ---- Gemini Router: decides df_query vs intent vs smalltalk ----
@@ -1444,14 +1966,33 @@ def gemini_route(user_text: str, df: pd.DataFrame) -> dict | None:
         schema = build_df_schema_context(df)
 
         system = (
-            "You are a router for a whisky collection Telegram bot.\n"
-            "Return STRICT JSON only (no markdown, no explanations).\n\n"
-            "Routes:\n"
-            "- df_query: user asks about their collection data (counts, filters, lists, stats).\n"
-            "- intent: user asks to perform an action (update drinking/stock changes/recommendation).\n"
-            "- smalltalk: greeting / chat not requiring data.\n\n"
-            "If route=df_query, produce df_plan (no SQL).\n"
-            "Confidence is 0..1.\n"
+            "You convert user questions into a STRICT JSON query plan over a pandas DataFrame.\n"
+            "Return JSON ONLY.\n"
+            "You MUST use only columns that exist in the provided schema.\n"
+            "Never write SQL.\n"
+            "When the user asks how many bottles (or Hebrew equivalents like כמה בקבוקי/כמה בקבוקים), prefer counting UNIQUE bottles using nunique on bottle_id if that column exists.\n"
+            "Allowed ops: eq, ne, lt, lte, gt, gte, contains, in, is_null, not_null.\n"
+            "Allowed agg funcs: count, nunique, sum, avg, min, max.\n"
+
+            # ✅ ADD THIS BLOCK
+            "IMPORTANT DOMAIN RULE:\n"
+            "Column final_smoky_sweet_score represents a SWEET ↔ SMOKY scale.\n"
+            "Scale definition:\n"
+            "- LOWER values = MORE SWEET / LESS SMOKY\n"
+            "- HIGHER values = MORE SMOKY / LESS SWEET\n"
+
+            "Interpret user intent semantically, including Hebrew terms.\n"
+
+            "Sorting rules:\n"
+            "- 'most sweet', 'הכי מתוק', 'מתיקות גבוהה', 'עדין', 'לא מעושן', 'פירותי ועדין' -> order_by final_smoky_sweet_score direction asc\n"
+            "- 'most smoky', 'הכי מעושן', 'כבד', 'עשן חזק', 'עשן קיצוני', 'peat heavy' -> order_by final_smoky_sweet_score direction desc\n"
+            "- 'least smoky', 'הכי פחות מעושן' -> direction asc\n"
+            "- 'least sweet', 'הכי פחות מתוק' -> direction desc\n"
+
+            "If the question implies EXTREME (most / least), always apply sorting + limit 1.\n"
+            "Never reverse this scale logic.\n"
+            "If the user asks about sweet/smoky and final_smoky_sweet_score exists, prefer using it for ordering.\n"
+            "Limit must be between 1 and 50.\n"
         )
 
         user_payload = {
@@ -1781,6 +2322,7 @@ async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame) -> str | 
     except Exception as e:
         logging.warning(f"Gemini fallback failed: {e}")
         return None
+    
 def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
     try:
         schema = build_df_schema_context(df)
@@ -1925,7 +2467,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stage-aware handler: can receive TEXT or PHOTO
     stage = _get_add_stage(context)
-
+    r = None
+    
     # If we're waiting for a label photo, accept PHOTO messages
     if stage == "await_label_photo":
         # Allow cancel even while waiting for a photo
@@ -1980,6 +2523,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+
+    # ----- HARD RULE: sweet/smoky & delicate/rich extremes -----
+    df = get_all_data_as_df()
+    
+    
+    ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, df)
+    if ans:
+        await update.message.reply_text(ans)
+        return    
+    
     
     # Global cancel
     if _normalize_text(user_text) in [_normalize_text(x) for x in _CANCEL_WORDS]:
@@ -2381,6 +2934,126 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = get_all_data_as_df()
         active_df = df[df["stock_status_per"] > 0].copy()
 
+        # ===========================
+        # Bottle-specific: flavors / casks (MUST be before Gemini df_query)
+        # ===========================
+        # A) extremes only when asking "הכי ..."
+        if _is_extremes_question(user_text):
+            ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, df)
+            if ans:
+                await update.message.reply_text(ans)
+                return
+
+        # B) focus bottle flavor questions only for "כמה מתוק הוא / האם הוא עדין / הוא עשיר?"
+        if _is_focus_flavor_question(user_text):
+            ans = try_handle_focus_bottle_flavor_questions(user_text, df, context)
+            if ans:
+                await update.message.reply_text(ans)
+                return
+        # A) Flavors of a bottle
+        if _looks_like_flavors_of_bottle_query(user_text):
+            term = user_text
+            term = re.sub(r"(?i)\b(מה|איזה|הטעמים|טעמים|טעם|ארומה|ארומות|nose|palate|palette|שלו|שלה|של|בבקבוק|בקבוק)\b", " ", term)
+            term = re.sub(r"\s+", " ", term).strip()
+
+            # follow-up mode -> focused bottle
+            if _is_focus_placeholder(term):
+                focus_row = _get_focus_bottle_row(active_df, context)
+                if focus_row is not None:
+                    _set_focus_bottle(context, focus_row)  # ✅ keep focus consistent
+                    await update.message.reply_text(build_flavors_reply(focus_row), parse_mode="Markdown")
+                    return
+                    return
+                await update.message.reply_text("על איזה בקבוק תרצה את הטעמים? (לדוגמה: 'מה הטעמים של Glenfiddich 15')")
+                return
+
+            # explicit bottle name
+            match = find_best_bottle_match(term, active_df)
+            if not match.get("best_name") or float(match.get("score") or 0) < 0.70:
+                await update.message.reply_text("לא הצלחתי לזהות את הבקבוק. נסה לכתוב מזקקה + שם הבקבוק.")
+                return
+
+            chosen = match.get("candidates", [])[0]
+            sub = active_df[active_df["bottle_id"] == chosen["bottle_id"]]
+            if sub.empty:
+                await update.message.reply_text("לא מצאתי את הבקבוק הזה במלאי הפעיל.")
+                return
+
+            row = sub.iloc[0]
+            _set_focus_bottle(context, row)
+            await update.message.reply_text(
+    build_flavors_reply(row),
+    parse_mode="Markdown"
+)
+            return
+
+        # B) Casks of a bottle ("איזה חבית הוא")
+        if _looks_like_casks_of_bottle_query(user_text):
+            term = user_text
+            term = re.sub(r"(?i)\b(מה|איזה|חבית|חביות|cask|casks|aged|in|שלו|שלה|של|בבקבוק|בקבוק|החבית|החביות)\b", " ", term)
+            term = re.sub(r"\s+", " ", term).strip()
+
+            if _is_focus_placeholder(term):
+                focus_row = _get_focus_bottle_row(active_df, context)
+                if focus_row is not None:
+                    _set_focus_bottle(context, focus_row)  # ✅ keep focus consistent
+                    await update.message.reply_text(build_casks_reply(focus_row), parse_mode="Markdown")
+                    return
+                await update.message.reply_text("על איזה בקבוק תרצה לדעת את החביות? (לדוגמה: 'איזה חבית הוא Glenmorangie 10')")
+                return
+
+            match = find_best_bottle_match(term, active_df)
+            if not match.get("best_name") or float(match.get("score") or 0) < 0.70:
+                await update.message.reply_text("לא הצלחתי לזהות את הבקבוק. נסה לכתוב מזקקה + שם הבקבוק.")
+                return
+
+            chosen = match.get("candidates", [])[0]
+            sub = active_df[active_df["bottle_id"] == chosen["bottle_id"]]
+            if sub.empty:
+                await update.message.reply_text("לא מצאתי את הבקבוק הזה במלאי הפעיל.")
+                return
+
+            row = sub.iloc[0]
+            _set_focus_bottle(context, row)
+            await update.message.reply_text(
+    build_casks_reply(row),
+    parse_mode="Markdown"
+)
+            return
+
+        # C) Age of a bottle ("מה הגיל שלו")
+        if _looks_like_age_of_bottle_query(user_text):
+            term = user_text
+            term = re.sub(r"(?i)\b(מה|כמה|בן|גיל|שנים|age|aged|שלו|שלה|של|בבקבוק|בקבוק)\b", " ", term)
+            term = re.sub(r"\s+", " ", term).strip()
+
+            # follow-up mode -> focused bottle
+            if _is_focus_placeholder(term):
+                focus_row = _get_focus_bottle_row(active_df, context)
+                if focus_row is not None:
+                    _set_focus_bottle(context, focus_row)
+                    await update.message.reply_text(build_age_reply(focus_row), parse_mode="Markdown")
+                    return
+                await update.message.reply_text("על איזה בקבוק תרצה לדעת את הגיל? (לדוגמה: 'מה הגיל של Glenfiddich 15')")
+                return
+
+            # explicit bottle name
+            match = find_best_bottle_match(term, active_df)
+            if not match.get("best_name") or float(match.get("score") or 0) < 0.70:
+                await update.message.reply_text("לא הצלחתי לזהות את הבקבוק. נסה לכתוב מזקקה + שם הבקבוק.")
+                return
+
+            chosen = match.get("candidates", [])[0]
+            sub = active_df[active_df["bottle_id"] == chosen["bottle_id"]]
+            if sub.empty:
+                await update.message.reply_text("לא מצאתי את הבקבוק הזה במלאי הפעיל.")
+                return
+
+            row = sub.iloc[0]
+            _set_focus_bottle(context, row)
+            await update.message.reply_text(build_age_reply(row), parse_mode="Markdown")
+            return
+        
         # build inventory dict once when needed
 
         # 2) Analytics / research questions (no Gemini)
@@ -2628,6 +3301,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sub["is_overdue"] = sub["target_dt"].dt.normalize() < today
 
             pick = sub.sort_values(["is_overdue", "target_dt"], ascending=[False, True]).head(1).iloc[0]
+
+            # ✅ פה: לקבע פוקוס על הבקבוק שהומלץ עכשיו
+            _set_focus_bottle(context, pick)
+
             suffix = " (עבר/דחוף)" if bool(pick.get("is_overdue")) else ""
             await update.message.reply_text(
                 f"🥃 הדראם הבא המומלץ לפי Forecast (הכי קרוב/דחוף) הוא:\n"
@@ -2653,6 +3330,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             best_score = float(m.get("score") or 0)
 
             if best_name and best_score >= 0.78 and _token_overlap_ok(term, best_name, min_overlap=0.70):
+                # ✅ קבע פוקוס על הבקבוק שמצאת
+                # best_name זה שם, אבל יש לך גם candidate עם bottle_id בתוך m["candidates"]
+                chosen = (m.get("candidates") or [None])[0]
+
+                if chosen and chosen.get("bottle_id") is not None:
+                    sub_focus = active_df[active_df["bottle_id"] == chosen["bottle_id"]]
+                    if not sub_focus.empty:
+                        _set_focus_bottle(context, sub_focus.iloc[0])
+
                 await update.message.reply_text(f"כן 🙂 יש לך את:\n✅ {best_name}")
                 return
 
@@ -2846,6 +3532,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
 
         # ---- Gemini Router ----
+        r=""
         route = gemini_route(user_text, df)
         conf = float(route.get("confidence", 0) or 0) if route else 0.0
 
@@ -2878,29 +3565,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("לא מצאתי תוצאות לפי הבקשה.")
                     return
 
-                # ---------- C) זיהוי אם המשתמש שאל על חביות ----------
-                txt = (user_text or "")
-                user_asked_casks = ("חבית" in txt) or ("חביות" in txt) or ("cask" in txt.lower())
 
-                # ---------- D) חביות: סופרים ידנית מתוך df המקורי ----------
-                # (כי בטבלה המקורית אין "count")
-                if user_asked_casks and "casks_aged_in" in df.columns:
-                    ranking = (
-                        df["casks_aged_in"]
-                        .dropna()
-                        .astype(str)
-                        .value_counts()
-                        .reset_index()
-                    )
-                    ranking.columns = ["casks_aged_in", "count"]
-
-                    formatted_text = format_top_casks(ranking)
-
-                    if len(formatted_text) > 4000:
-                        formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
-
-                    await update.message.reply_text(formatted_text, parse_mode="Markdown")
-                    return
 
                 # ---------- E) ברירת מחדל: פורמט רגיל ----------
                 formatted_text = format_result(res)
