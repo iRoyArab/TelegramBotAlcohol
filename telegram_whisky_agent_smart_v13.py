@@ -49,6 +49,129 @@ bq_client = bigquery.Client.from_service_account_json(SERVICE_ACCOUNT_FILE, proj
 # ==========================================
 CACHE_DATA = {"df": None, "last_update": 0}
 
+import re
+
+STOPWORDS = set([
+    "איזה","אילו","יש","לי","תן","תביא","כל","שלי","בבקשה",
+    "וויסקי","בקבוקים","בקבוקי","בטעם","בטעמי","טעם","טעמים",
+    "ארומה","ארומות","ריח","נוז","של","עם","בלי","ב","על","את",
+])
+
+def extract_keywords(user_text: str) -> list[str]:
+    t = user_text.strip().lower()
+
+    # נרמול מפרידים
+    t = re.sub(r"[(){}\[\].!?\":;]", " ", t)
+    t = t.replace(" ו", ",").replace(" עם", ",")
+    t = re.sub(r"\s+", " ", t)
+
+    # חיתוך ראשוני לפי פסיקים
+    raw_parts = [p.strip() for p in t.split(",") if p.strip()]
+
+    # טוקניזציה נוספת (כדי לתפוס “שוקולד וקפה” בלי פסיק)
+    tokens = []
+    for p in raw_parts:
+        for w in p.split():
+            if w and w not in STOPWORDS and len(w) >= 2:
+                tokens.append(w)
+
+    # dedupe שומר סדר
+    Picked = []
+    for x in tokens:
+        if x not in Picked:
+            Picked.append(x)
+
+    return Picked
+
+COL_ALIASES = {
+    "palette": "palate",
+    "orignal_volume": "original_volume",
+}
+
+def should_skip_planner(user_text: str) -> bool:
+    t = (user_text or "").strip().lower()
+    if not t:
+        return True
+    # עדכונים/פעולות שעדיף hard-rule
+    if any(x in t for x in ["שתיתי", "שתיה", "עדכן", "עדכון", "הוסף", "להוסיף", "מחיקה", "/start", "/help"]):
+        return True
+    return False
+
+import re
+
+_FLAVOR_MARKERS = ("בטעמי", "בטעם", "טעמים של", "עם טעמים של")
+
+def enforce_palette_free_text(plan: dict, user_text: str) -> dict:
+    if not isinstance(plan, dict):
+        return plan
+
+    t = (user_text or "").strip()
+    tl = t.lower()
+
+    # אם אין "בטעם/בטעמי" – לא נוגעים
+    if not any(m in tl for m in _FLAVOR_MARKERS):
+        return plan
+
+    # קח את כל מה שאחרי הסמן הראשון שמופיע
+    idx = min([tl.find(m) for m in _FLAVOR_MARKERS if tl.find(m) != -1])
+    tail = t[idx:]
+    # חתוך את המילים "בטעם/בטעמי/טעמים של" עצמן
+    for m in _FLAVOR_MARKERS:
+        if tail.lower().startswith(m):
+            tail = tail[len(m):].strip()
+            break
+
+    if not tail:
+        return plan
+
+    # נרמול מפרידים: פסיק, ו, או, /, &
+    tail = tail.replace("&", ",").replace("/", ",")
+    tail = re.sub(r"\s+ו\s+", ",", tail)      # "... שוקולד ו קפה ..." -> ","
+    tail = tail.replace(" או ", ",")          # "... שוקולד או קפה ..." -> ","
+    tail = re.sub(r"[(){}\[\].!?\":;]", " ", tail)
+
+    parts = [p.strip() for p in tail.split(",") if p.strip()]
+
+    stop = {"וויסקי","בקבוק","בקבוקים","בקבוקי","טעם","טעמים","של","עם","יש","לי","איזה","אילו"}
+    keys = []
+    for p in parts:
+        # הסר מילים כלליות מתוך הביטוי
+        words = [w for w in p.split() if w not in stop]
+        k = " ".join(words).strip()
+        if k:
+            keys.append(k)
+
+    # dedupe
+    Picked = []
+    for k in keys:
+        if k not in Picked:
+            Picked.append(k)
+
+    if not Picked:
+        return plan
+
+    # OR/AND
+    logic = "OR" if " או " in tl else ("AND" if ("וגם" in tl or "שניהם" in tl) else (plan.get("filter_logic") or "OR"))
+
+    # מכריח פילטרים על palette
+    plan["filter_logic"] = logic
+    plan["filters"] = [{"col": "palette", "op": "contains", "value": k} for k in Picked]
+
+    # בוחר עמודות מינימליות לרשימה
+    plan["select"] = ["distillery", "bottle_name", "bottle_id"]
+    plan["limit"] = min(max(int(plan.get("limit") or 20), 1), 50)
+    return plan
+
+
+def normalize_plan_columns(plan: dict, df) -> dict:
+    p = plan
+    for f in (p.get("filters") or []):
+        c = f.get("col")
+        if c not in df.columns and c in COL_ALIASES and COL_ALIASES[c] in df.columns:
+            f["col"] = COL_ALIASES[c]
+    p["select"] = [COL_ALIASES.get(c, c) for c in (p.get("select") or [])]
+    return p
+
 SWEETNESS_RANGES = {
     'Very Sweet': (0, 1.5),
     'Sweet-Citrucy': (1.51, 2.0),
@@ -56,7 +179,7 @@ SWEETNESS_RANGES = {
     'Coffee Like- Sea Salt': (2.75, 4.0),
     'Minerals - Sulfur': (4.01, 5.5),
     'Ash - BBQ Smoke': (5.51, 7.5),
-    'Heavy Peat - Medicinal Smoke': (7.51, 100.0)
+    'Heavy Peat - Medicinal Smoke': (7.51, 10.0)
 }
 
 RICHNESS_RANGES = {
@@ -86,6 +209,9 @@ def _is_focus_flavor_question(text: str) -> bool:
     - כמה מתוק הוא?
     - האם הוא עדין?
     - הוא עשיר?
+    - הוא סמיך?
+    -הוא מעושן?
+    -הוא מר?
     """
     if not text:
         return False
@@ -494,6 +620,8 @@ def _set_focus_bottle(context: ContextTypes.DEFAULT_TYPE, row: pd.Series | dict)
     except Exception:
         pass
 
+
+
 def _get_focus_bottle_row(active_df: pd.DataFrame, context: ContextTypes.DEFAULT_TYPE) -> pd.Series | None:
     bid = context.user_data.get("focus_bottle_id")
     if not bid:
@@ -582,6 +710,44 @@ def _similarity_ratio(a: str, b: str) -> float:
     d = get_levenshtein_distance(a_n, b_n)
     return 1.0 - (d / max(len(a_n), len(b_n)))
 
+def format_df_answer(df: pd.DataFrame, plan: dict) -> str:
+    if df is None or df.empty:
+        return "לא נמצאו תוצאות."
+
+    # אם יש aggregations (למשל כמה בקבוקים)
+    if plan.get("aggregations"):
+        # לוקחים את הערך הראשון מהתוצאה
+        row = df.iloc[0]
+        lines = []
+        for col in df.columns:
+            val = row.get(col)
+            lines.append(f"{col}: {val}")
+        return "\n".join(lines)
+
+    # אם זו רשימת בקבוקים
+    cols = df.columns.tolist()
+
+    # אם יש bottle_name ו-distillery
+    if "bottle_name" in cols:
+        lines = []
+        for _, r in df.iterrows():
+            dist = r.get("distillery", "")
+            name = r.get("bottle_name", "")
+            if dist:
+                lines.append(f"• {dist} — {name}")
+            else:
+                lines.append(f"• {name}")
+        return "\n".join(lines)
+
+    # אם זו שאלה על שדה בודד (למשל ABV)
+    if len(cols) == 1:
+        val = df.iloc[0][cols[0]]
+        return f"{cols[0]}: {val}"
+
+    # fallback כללי
+    return df.to_string(index=False)
+
+
 # ==========================================
 # SQL helpers
 # ==========================================
@@ -669,10 +835,15 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         bottle = (bottle or "-").strip()
         return f"{medal} {dist} – {bottle}  ·  {score:.2f}/{max_score}"
 
-    def _pretty_top3(title: str, metric_label: str, max_score: int, hint: str, rows: pd.DataFrame, score_col: str, all_series: pd.Series, richness: pd.Series) -> str:
+    def _pretty_top3(title: str, metric_label: str, max_score: int, max_2: int, hint: str, rows: pd.DataFrame, score_col: str, all_series: pd.Series, richness: pd.Series) -> str:
         sep = "━━━━━━━━━━━━━━━━━━"
         lines = []
         n = min(3, len(rows))
+        if 'מתוקים' in title or 'מעושנים' in title:
+            max_score = max_score
+        elif 'עשירים/סמיכים' in title or 'עדינים' in title:
+            max_score = max_2
+            
         for idx in range(n):
             r = rows.iloc[idx]
             score = float(r.get(score_col))
@@ -682,7 +853,7 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         avg_richness = float(pd.to_numeric(richness, errors="coerce").dropna().mean()) if richness is not None else None
         avg_line = (
     f"📌 ממוצע מתיקות: {avg:.2f} / {max_score}\n"
-    f"📌 ממוצע סמיכות: {avg_richness:.2f} / {max_score}\n"
+    f"📌 ממוצע סמיכות: {avg_richness:.2f} / {max_2}\n"
 ) 
 
         return (
@@ -708,6 +879,7 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
             title="🍯 טופ 3 הבקבוקים הכי מתוקים אצלך",
             metric_label="מדד מתוק↔עשן",
             max_score=12,
+            max_2 = 30,
             hint="🟢 נמוך יותר = מתוק יותר",
             rows=rows,
             score_col="final_smoky_sweet_score", all_series=all_series, richness=all_series_richness
@@ -722,6 +894,7 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
             title="🔥 טופ 3 הבקבוקים הכי מעושנים אצלך",
             metric_label="מדד מתוק↔עשן",
             max_score=12,
+            max_2 = 30,
             hint="🟠 גבוה יותר = מעושן יותר",
             rows=rows,
             score_col="final_smoky_sweet_score", all_series=all_series, richness=all_series_richness
@@ -735,7 +908,9 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         return _pretty_top3(
             title="🌿 טופ 3 הבקבוקים הכי עדינים אצלך",
             metric_label="מדד עדין↔עשיר",
-            max_score=30,
+            max_score = 12,
+            max_2=30,
+            
             hint="🟢 נמוך יותר = עדין יותר",
             rows=rows,
             score_col="final_richness_score", all_series=all_series, richness=all_series_richness
@@ -749,7 +924,8 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         return _pretty_top3(
             title="🥃 טופ 3 הבקבוקים הכי עשירים/סמיכים אצלך",
             metric_label="מדד עדין↔עשיר",
-            max_score=30,
+            max_score = 12,
+            max_2=30,
             hint="🟠 גבוה יותר = עשיר יותר",
             rows=rows,
             score_col="final_richness_score", all_series=all_series, richness=all_series_richness
@@ -1166,6 +1342,14 @@ def _make_category_mask(df: pd.DataFrame, kind: str) -> pd.Series:
         return s.str.contains(r"white\\s*wine", regex=True, na=False)
 
     return pd.Series([False] * len(df))
+
+_TEXT_SEARCH_INTENT_RE = re.compile(
+    r"(בטעם|בטעמי|טעם|טעמים|ארומה|ארומות|ריח|נוז|nose|aroma|palate|palette|taste|flavor|חבית|חביות|יישון|cask|casks|aged|שרי|sherry)",
+    re.IGNORECASE
+)    
+
+def looks_like_text_intent(user_text: str) -> bool:
+    return bool(_TEXT_SEARCH_INTENT_RE.search(user_text or ""))
 
 def _is_count_question(user_text: str) -> bool:
     t = _normalize_text(user_text)
@@ -1878,20 +2062,50 @@ def build_df_schema_context(df: pd.DataFrame, max_examples: int = 12) -> dict:
         return ctx
 
     for col in df.columns:
-        dtype = str(df[col].dtype)
+        ser = df[col]
+        dtype = str(ser.dtype)
         entry = {"name": col, "dtype": dtype}
 
-        # small examples for object cols (helps Gemini choose filters)
+        nonnull = ser.dropna()
+
+        # --------------------------
+        # TEXT (object)
+        # --------------------------
         if dtype == "object":
             vals = (
-                df[col]
-                .dropna()
+                nonnull
                 .astype(str)
                 .map(lambda x: x.strip())
                 .loc[lambda s: s != ""]
                 .unique()
                 .tolist()
             )
+            if vals:
+                entry["examples"] = vals[:max_examples]
+
+        # --------------------------
+        # NUMERIC (int/float/bool)
+        # --------------------------
+        elif pd.api.types.is_numeric_dtype(ser):
+            nums = pd.to_numeric(nonnull, errors="coerce").dropna()
+            if not nums.empty:
+                # examples
+                ex = nums.unique().tolist()[:max_examples]
+                entry["examples"] = ex
+
+                # min/max (מאוד עוזר ל-Gemini להבין שזה ABV/price/etc)
+                try:
+                    entry["min"] = float(nums.min())
+                    entry["max"] = float(nums.max())
+                except Exception:
+                    pass
+
+        # --------------------------
+        # DATETIME
+        # --------------------------
+        elif pd.api.types.is_datetime64_any_dtype(ser):
+            # stringify a few values
+            vals = nonnull.astype(str).unique().tolist()
             if vals:
                 entry["examples"] = vals[:max_examples]
 
@@ -2306,44 +2520,123 @@ def rule_based_inventory_answer(user_text: str, df: pd.DataFrame) -> str | None:
 
     return None
 
-async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame) -> str | None:
-    """Use Gemini to build a strict df_query plan and execute it. Returns a user reply, or None."""
-    plan = gemini_make_df_query_plan(user_text, df)
-    if plan and isinstance(plan, dict):
-        try:
-            res = execute_df_query_plan(df, plan)
-            return _df_to_telegram_text(res)
-        except Exception as e:
-            logging.warning(f"DF plan execution failed: {e}")
-            # fall through to natural-language fallback
-    # final fallback: free text answer (still grounded by schema sample)
-    try:
-        return await gemini_fallback_answer(user_text, df)
-    except Exception as e:
-        logging.warning(f"Gemini fallback failed: {e}")
-        return None
-    
-def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
+
+def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | None = None) -> dict | None:
     try:
         schema = build_df_schema_context(df)
-
+        COLUMN_GLOSSARY = {
+            "avg_consumption_vol_per_day": [
+                "ממוצע שתייה", "כמה אני שותה ממנו בממוצע", "בממוצע", "popular", "פופולריות", "כמה נשתה", "צריכה יומית", "ml ליום"
+            ],
+            "latest_consumption_time": [
+                "  ממנו לאחרונה", "מתי  לאחרונה", "פעם אחרונה", "last drink", "אחרון", "תאריך שתייה אחרון"
+            ],
+            "predicted_finish_date": [
+                "מתי הוא צפוי להיגמר", "מתי ייגמר", "יסתיים", "finish date", "מתי נגמר"
+            ],
+            "est_consumption_date": [
+                "מתי לשתות ממנו", "מתי כדאי לשתות", "המלצה מתי לשתות", "recommend date", "דראם הבא מתי", "מה לשתות עכשיו"
+            ],
+            "Best_Before": [
+                "עד מתי כדאי לשתות אותו", "עד מתי כדאי לשתות ממנו", "best before", "תוקף", "מומלץ עד", "לפני שיתחמצן"
+            ],
+            "orignal_volume": [
+                "מה הנפח שלו", "כמה ml", "נפח", "volume", "700", "1000", "גודל בקבוק"
+            ],
+            # בונוסים שימושיים:
+            "current_status": ["כמה נשאר", "אחוז נשאר", "remaining", "left", "סטוק", "מלאי"],
+            "alcohol_percentage": ["אלכוהול אחוז", "abv", "strength", "אלכוהול"],
+            "age": ["גיל", "בן כמה", "age statement"],
+            "price": ["מחיר", "כמה עלה", "עלות", "₪"],
+            "casks_aged_in": ["חבית", "חביות", "cask", "aged in"],
+            "nose": ["nose", "נוז", "ארומות", "ריח"],
+            "palette": ["palate", "פלטה", "טעמים", "taste"]
+        }
+        
+        
         system = (
             "You convert user questions into a STRICT JSON query plan over a pandas DataFrame.\n"
             "Return JSON ONLY.\n"
             "You MUST use only columns that exist in the provided schema.\n"
-            "Never write SQL.\n"
-            "When the user asks how many bottles (or Hebrew equivalents like כמה בקבוקי/כמה בקבוקים), prefer counting UNIQUE bottles using nunique on bottle_id if that column exists.\n"
+            "Never write SQL.\n\n"
+
+            "COLUMN SELECTION RULES (VERY IMPORTANT):\n"
+            "You are given a COLUMN_GLOSSARY that maps user intents/synonyms to specific columns.\n"
+            "When the question matches a glossary entry, you MUST use the mapped column.\n"
+            "Prefer the most specific column available (e.g., predicted_finish_date vs est_consumption_date).\n"
+            "If the user asks a direct 'field question', put that column in `select`.\n"
+            "If the user asks 'how many' or asks for an aggregate, use `aggregations`.\n\n"
+            
+            "PRIORITY RULE (CRITICAL):\n"
+            "- If the question contains taste/aroma/cask intent, NEVER treat it as a bottle-name matching task.\n"
+            "- Do NOT propose close name candidates. Build a DataFrame query plan instead.\n"            
+            "TEXT SEARCH RULES (CRITICAL):\n"
+            
+            "- If the user asks for bottles by flavors/tastes (Hebrew: 'בטעם', 'בטעמי', 'טעמים', 'טעמי', 'שוקולד', 'קפה', etc.),\n"
+            "  you MUST filter using: palette contains <keyword(s)>.\n"
+            "- If the user asks for bottles by aromas/smells (Hebrew: 'ארומה', 'ארומות', 'ריח', 'נוז'),\n"
+            "  you MUST filter using: nose contains <keyword(s)>.\n"
+            "- If the user asks for bottles by cask/aging (Hebrew: 'חבית', 'חביות', 'יישון', 'שרי', 'בשרי', or English: 'sherry', 'cask'),\n"
+            "  you MUST filter using: casks_aged_in contains <keyword(s)>.\n"
+            "\n"
+            "KEYWORD EXTRACTION RULES:\n"
+            "- Extract the requested keywords from the user message (e.g., 'שוקולד וקפה' -> ['שוקולד','קפה']).\n"
+            "- If the user uses 'או' -> use OR logic: multiple filters that broaden results.\n"
+            "- If the user uses 'וגם'/'שניהם' -> use AND logic: multiple filters that narrow results.\n"
+            "\n"
+            "SHERRY EXPANSION (IMPORTANT):\n"
+            "- If the user asks for 'שרי' or 'sherry', also consider matching common sherry terms in casks_aged_in:\n"
+            "  ['sherry','oloroso','px','pedro ximenez','ximenez','ximénez'].\n"
+            "\n"
+            "LISTING RULE:\n"
+            "- For list questions ('איזה וויסקי', 'תן לי כל הבקבוקים', 'show me bottles'), select minimal identity columns:\n"
+            "  distillery, bottle_name, bottle_id (if exists). Limit 10-20.\n"
+        
+            "OUTPUT CONSTRAINTS (CRITICAL):\n"
+            "Never use select=['*'] unless the user explicitly asks for 'all details / everything / כל הפרטים / כל הנתונים'.\n"
+            "By default, select ONLY the minimal columns needed to answer the question (usually 1-3 columns).\n"
+            "If the user asks a single metric (ABV, age, price, volume, last drink date, predicted finish, best before, avg consumption), select exactly that column.\n\n"
+
+            "FOCUS RULES (VERY IMPORTANT):\n"
+            "If focus.bottle_id is provided OR the user uses pronouns like 'שלו/הוא/זה/בו', "
+            "you MUST add a filter on bottle_id == focus.bottle_id. "
+            "If bottle_id is missing from schema, filter by full_name contains focus.full_name.\n\n"
+
+            "FREE-TEXT FLAVOR EXTRACTION (CRITICAL):\n"
+            "- When the user asks: 'איזה בקבוקים יש לי בטעמי X,Y,Z' or similar,\n"
+            "  treat X,Y,Z as FREE-TEXT keywords (do NOT require predefined lists).\n"
+            "- Extract keywords as the terms that appear AFTER these markers:\n"
+            "  ['בטעמי', 'בטעם', 'טעמים של', 'עם טעמים של'].\n"
+            "- Split keywords by separators: comma ',', Hebrew 'ו' (and), '/', '&', and the word 'או'.\n"
+            "- Remove generic words like: ['וויסקי','בקבוקים','בקבוקי','טעמים','בטעם','בטעמי','של','עם','יש','לי'].\n"
+            "- Then build filters on column 'palette' using op='contains' for each keyword.\n"
+            "- If the user uses 'או' -> set filter_logic='OR'.\n"
+            "- If the user uses 'וגם' or 'שניהם' -> set filter_logic='AND'.\n"
+            
+            "Counting rule:\n"
+            "When the user asks how many bottles (or Hebrew like כמה בקבוקי/כמה בקבוקים), "
+            "prefer counting UNIQUE bottles using nunique on bottle_id if that column exists.\n\n"
+
             "Allowed ops: eq, ne, lt, lte, gt, gte, contains, in, is_null, not_null.\n"
             "Allowed agg funcs: count, nunique, sum, avg, min, max.\n"
             "Limit must be between 1 and 50.\n"
+
+            "IDENTITY COLUMNS:\n"
+            "- When returning multiple bottles, always include bottle_id (if exists), bottle_name, distillery.\n"
+            "- Do NOT select large text columns unless needed.\n"
         )
 
         user = {
             "message": user_text,
+            "focus": focus,
             "schema": schema,
+            "column_glossary": COLUMN_GLOSSARY,   # <-- חדש ומאוד חשוב
             "output_schema": {
                 "action": "df_query",
+                "need_clarification": False,
+                "clarifying_question": "",
                 "select": ["<col>", "..."],
+                "filter_logic": "AND|OR",
                 "filters": [{"col": "<col>", "op": "<op>", "value": "<any or null>"}],
                 "group_by": ["<col>", "..."],
                 "aggregations": [{"col": "<col|*>", "func": "<agg>", "as": "<alias>"}],
@@ -2377,6 +2670,78 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame) -> dict | None:
     except Exception as e:
         logging.warning(f"Gemini df_query planner failed: {e}")
         return None
+    
+    
+def _looks_like_df_analytics_question(t: str) -> bool:
+    t = _normalize_text(t)
+    # אנליטיקה/חישובים/השוואות/טופים/פילוחים
+    cues = [
+        "כמה", "ספור", "מספר", "count",
+        "ממוצע", "average", "avg",
+        "אחוז", "%", "חלק", "share", "מתוך", "percent",
+        "הכי", "top", "מקסימום", "מינימום", "max", "min",
+        "לפי", "פילוח", "התפלגות", "distribution",
+        "יותר מ", "פחות מ", "בין", "מעל", "מתחת",
+        "השווה", "לעומת", "versus",
+    ]
+    return any(c in t for c in cues)
+
+async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame, context) -> str | None:
+    user_text = (user_text or "").strip()
+    if not user_text or df is None or df.empty:
+        return None
+
+    focus = None
+    bid = context.user_data.get("focus_bottle_id")
+    full = context.user_data.get("focus_full_name")
+    if bid:
+        focus = {"bottle_id": int(bid), "full_name": full}
+
+    df_question = _looks_like_df_analytics_question(user_text)
+
+    # 1) Planner-first (soft)
+    try:
+        if not should_skip_planner(user_text):
+            plan = gemini_make_df_query_plan(user_text, df, focus=focus)
+            plan = enforce_palette_free_text(plan, user_text)
+
+            if plan and isinstance(plan, dict):
+                if "order_by'" in plan and "order_by" not in plan:
+                    plan["order_by"] = plan.pop("order_by'")
+
+                try:
+                    plan = normalize_plan_columns(plan, df)
+                except Exception:
+                    pass
+
+                res = execute_df_query_plan(df, plan)
+
+                # ✅ return ONLY if meaningful
+                if res is not None:
+                    if isinstance(res, pd.DataFrame) and not res.empty:
+                        return format_df_answer(res, plan)  # או _df_to_telegram_text(res)
+                    if isinstance(res, pd.Series) and not res.empty:
+                        return _df_to_telegram_text(res.to_frame().T)
+
+                # ❗ אם זו שאלה אנליטית — אל תיפול לגנרי
+                if df_question:
+                    return None
+
+    except Exception as e:
+        logging.warning(f"DF plan execution failed: {e}")
+        if df_question:
+            return None
+
+    # 2) Free-text fallback ONLY when it's NOT an analytics/DF question
+    if not df_question:
+        try:
+            return await gemini_fallback_answer(user_text, df)
+        except Exception as e:
+            logging.warning(f"Gemini fallback failed: {e}")
+            return None
+
+    return None
+
     
 _ALLOWED_OPS = {"eq","ne","lt","lte","gt","gte","contains","in","is_null","not_null"}
 _ALLOWED_AGG = {"count","nunique","sum","avg","min","max"}
@@ -2468,7 +2833,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stage-aware handler: can receive TEXT or PHOTO
     stage = _get_add_stage(context)
     r = None
-    
+
+
     # If we're waiting for a label photo, accept PHOTO messages
     if stage == "await_label_photo":
         # Allow cancel even while waiting for a photo
@@ -2924,16 +3290,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if df is None:
         df = pd.DataFrame()
 
+
     fast = _try_fast_portfolio_answer(user_text, df)
     if fast:
         await update.message.reply_text(fast)
         return
-    
+
+
     # 2) Fresh data for deterministic intents
     try:
         df = get_all_data_as_df()
         active_df = df[df["stock_status_per"] > 0].copy()
 
+
+
+        # 2) Legacy handlers (מה שעבד לך פעם)
+        # - have_query / find_best_bottle_match / recommend וכו'
+        # ...
+        
         # ===========================
         # Bottle-specific: flavors / casks (MUST be before Gemini df_query)
         # ===========================
@@ -3061,10 +3435,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Smart analytics via Gemini DF planner (portfolio shares, flexible ratios, etc.)
         # We route percent-of-total questions here to avoid confusing them with "remaining stock" bottle questions.
         if _looks_like_portfolio_share_query(user_text):
-            reply = await try_gemini_df_query_answer(user_text, df)
+            reply = await try_gemini_df_query_answer(user_text, df, context)
             if reply:
                 await update.message.reply_text(reply)
                 return
+
 
         if _looks_like_popular_query(user_text):
             # Flexible scope via Gemini planner (e.g., "most popular of M&H")
@@ -3388,7 +3763,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # If RB couldn't infer category, try Gemini DF planner as fallback
-            reply = await try_gemini_df_query_answer(user_text, df)
+            reply = await try_gemini_df_query_answer(user_text, df, context)
             if reply:
                 await update.message.reply_text(reply)
                 return
@@ -3448,7 +3823,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # 2) Otherwise, Gemini DF planner for flexible analytics
-            reply = await try_gemini_df_query_answer(user_text, df)
+            reply = await try_gemini_df_query_answer(user_text, df, context)
             if reply:
                 await update.message.reply_text(reply)
                 return
@@ -3521,78 +3896,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
             return
         
-        fast = _try_fast_portfolio_answer(user_text, active_df)
-        if fast:
-            await update.message.reply_text(fast)
+        # 0) hard rules (שתיתי/הוספה/תמונה וכו') נשארים כרגיל
+        # ...
+
+
+        # --- FINAL: Gemini as the default engine (Option 2) ---
+        df = get_all_data_as_df()
+
+        try:
+            reply = await try_gemini_df_query_answer(user_text, df, context)
+            if reply:
+                await update.message.reply_text(reply)
+                return
+
+            await update.message.reply_text("לא הצלחתי להבין לגמרי את הבקשה. תנסה לנסח אחרת 🙏")
             return
 
-        # --- Fallback: free text -> df query plan via Gemini ---
-        df = get_all_data_as_df()
-        active_df = df[df["stock_status_per"] > 0].copy()
-        
-
-        # ---- Gemini Router ----
-        r=""
-        route = gemini_route(user_text, df)
-        conf = float(route.get("confidence", 0) or 0) if route else 0.0
-
-        if route and conf >= 0.60:
-            if route.get("need_clarification"):
-                await update.message.reply_text(route.get("clarifying_question") or "אפשר לחדד?")
-                return
-
-            r = (route.get("route") or "").lower()
-
-        if r == "df_query":
-            plan = route.get("df_plan") or {}
-            try:
-                res = execute_df_query_plan(df, plan)
-
-                # ---------- A) אם execute_df_query_plan מחזיר טקסט (STRING) ----------
-                # זה בדיוק המקרה שהראית: מופיעים "\\n" בתוך ההודעה
-                if isinstance(res, str):
-                    formatted_text = res.replace("\\n", "\n")
-
-                    if len(formatted_text) > 4000:
-                        formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
-
-                    # אם זה טקסט שכבר "מפורמט" - אל תכריח Markdown
-                    await update.message.reply_text(formatted_text)
-                    return
-
-                # ---------- B) אם אין תוצאות (רלוונטי רק ל-DataFrame/Series) ----------
-                if hasattr(res, "empty") and res.empty:
-                    await update.message.reply_text("לא מצאתי תוצאות לפי הבקשה.")
-                    return
-
-
-
-                # ---------- E) ברירת מחדל: פורמט רגיל ----------
-                formatted_text = format_result(res)
-
-                if len(formatted_text) > 4000:
-                    formatted_text = formatted_text[:4000] + "\n\n...התוצאה נחתכה"
-
-                await update.message.reply_text(formatted_text, parse_mode="Markdown")
-                return
-
-            except Exception as e:
-                await update.message.reply_text(f"שגיאה בהרצת השאילתה: {e}")
-                return
-
-
-        # ==========================================
-        # FINAL GEMINI FALLBACK (v14)
-        # ==========================================
-        try:
-            fallback_reply = await gemini_fallback_answer(user_text, df)
-
-            if fallback_reply:
-                await update.message.reply_text(fallback_reply)
-                return
-
         except Exception as e:
-            logging.warning(f"Fallback Gemini error: {e}")
+            logging.warning(f"Gemini DF engine error: {e}")
             await update.message.reply_text("לא הצלחתי להבין לגמרי את הבקשה. תנסה לנסח אחרת 🙏")
             return
         
