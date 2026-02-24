@@ -88,81 +88,6 @@ COL_ALIASES = {
     "orignal_volume": "original_volume",
 }
 
-def should_skip_planner(user_text: str) -> bool:
-    t = (user_text or "").strip().lower()
-    if not t:
-        return True
-    # עדכונים/פעולות שעדיף hard-rule
-    if any(x in t for x in ["שתיתי", "שתיה", "עדכן", "עדכון", "הוסף", "להוסיף", "מחיקה", "/start", "/help"]):
-        return True
-    return False
-
-import re
-
-_FLAVOR_MARKERS = ("בטעמי", "בטעם", "טעמים של", "עם טעמים של")
-
-def enforce_palette_free_text(plan: dict, user_text: str) -> dict:
-    if not isinstance(plan, dict):
-        return plan
-
-    t = (user_text or "").strip()
-    tl = t.lower()
-
-    # אם אין "בטעם/בטעמי" – לא נוגעים
-    if not any(m in tl for m in _FLAVOR_MARKERS):
-        return plan
-
-    # קח את כל מה שאחרי הסמן הראשון שמופיע
-    idx = min([tl.find(m) for m in _FLAVOR_MARKERS if tl.find(m) != -1])
-    tail = t[idx:]
-    # חתוך את המילים "בטעם/בטעמי/טעמים של" עצמן
-    for m in _FLAVOR_MARKERS:
-        if tail.lower().startswith(m):
-            tail = tail[len(m):].strip()
-            break
-
-    if not tail:
-        return plan
-
-    # נרמול מפרידים: פסיק, ו, או, /, &
-    tail = tail.replace("&", ",").replace("/", ",")
-    tail = re.sub(r"\s+ו\s+", ",", tail)      # "... שוקולד ו קפה ..." -> ","
-    tail = tail.replace(" או ", ",")          # "... שוקולד או קפה ..." -> ","
-    tail = re.sub(r"[(){}\[\].!?\":;]", " ", tail)
-
-    parts = [p.strip() for p in tail.split(",") if p.strip()]
-
-    stop = {"וויסקי","בקבוק","בקבוקים","בקבוקי","טעם","טעמים","של","עם","יש","לי","איזה","אילו"}
-    keys = []
-    for p in parts:
-        # הסר מילים כלליות מתוך הביטוי
-        words = [w for w in p.split() if w not in stop]
-        k = " ".join(words).strip()
-        if k:
-            keys.append(k)
-
-    # dedupe
-    Picked = []
-    for k in keys:
-        if k not in Picked:
-            Picked.append(k)
-
-    if not Picked:
-        return plan
-
-    # OR/AND
-    logic = "OR" if " או " in tl else ("AND" if ("וגם" in tl or "שניהם" in tl) else (plan.get("filter_logic") or "OR"))
-
-    # מכריח פילטרים על palette
-    plan["filter_logic"] = logic
-    plan["filters"] = [{"col": "palette", "op": "contains", "value": k} for k in Picked]
-
-    # בוחר עמודות מינימליות לרשימה
-    plan["select"] = ["distillery", "bottle_name", "bottle_id"]
-    plan["limit"] = min(max(int(plan.get("limit") or 20), 1), 50)
-    return plan
-
-
 def normalize_plan_columns(plan: dict, df) -> dict:
     p = plan
     for f in (p.get("filters") or []):
@@ -619,8 +544,6 @@ def _set_focus_bottle(context: ContextTypes.DEFAULT_TYPE, row: pd.Series | dict)
         context.user_data["focus_distillery"] = str(row.get("distillery") or "")
     except Exception:
         pass
-
-
 
 def _get_focus_bottle_row(active_df: pd.DataFrame, context: ContextTypes.DEFAULT_TYPE) -> pd.Series | None:
     bid = context.user_data.get("focus_bottle_id")
@@ -2602,17 +2525,6 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
             "you MUST add a filter on bottle_id == focus.bottle_id. "
             "If bottle_id is missing from schema, filter by full_name contains focus.full_name.\n\n"
 
-            "FREE-TEXT FLAVOR EXTRACTION (CRITICAL):\n"
-            "- When the user asks: 'איזה בקבוקים יש לי בטעמי X,Y,Z' or similar,\n"
-            "  treat X,Y,Z as FREE-TEXT keywords (do NOT require predefined lists).\n"
-            "- Extract keywords as the terms that appear AFTER these markers:\n"
-            "  ['בטעמי', 'בטעם', 'טעמים של', 'עם טעמים של'].\n"
-            "- Split keywords by separators: comma ',', Hebrew 'ו' (and), '/', '&', and the word 'או'.\n"
-            "- Remove generic words like: ['וויסקי','בקבוקים','בקבוקי','טעמים','בטעם','בטעמי','של','עם','יש','לי'].\n"
-            "- Then build filters on column 'palette' using op='contains' for each keyword.\n"
-            "- If the user uses 'או' -> set filter_logic='OR'.\n"
-            "- If the user uses 'וגם' or 'שניהם' -> set filter_logic='AND'.\n"
-            
             "Counting rule:\n"
             "When the user asks how many bottles (or Hebrew like כמה בקבוקי/כמה בקבוקים), "
             "prefer counting UNIQUE bottles using nunique on bottle_id if that column exists.\n\n"
@@ -2672,75 +2584,31 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
         return None
     
     
-def _looks_like_df_analytics_question(t: str) -> bool:
-    t = _normalize_text(t)
-    # אנליטיקה/חישובים/השוואות/טופים/פילוחים
-    cues = [
-        "כמה", "ספור", "מספר", "count",
-        "ממוצע", "average", "avg",
-        "אחוז", "%", "חלק", "share", "מתוך", "percent",
-        "הכי", "top", "מקסימום", "מינימום", "max", "min",
-        "לפי", "פילוח", "התפלגות", "distribution",
-        "יותר מ", "פחות מ", "בין", "מעל", "מתחת",
-        "השווה", "לעומת", "versus",
-    ]
-    return any(c in t for c in cues)
-
 async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame, context) -> str | None:
-    user_text = (user_text or "").strip()
-    if not user_text or df is None or df.empty:
-        return None
-
+    """Use Gemini to build a strict df_query plan and execute it. Returns a user reply, or None."""
     focus = None
     bid = context.user_data.get("focus_bottle_id")
     full = context.user_data.get("focus_full_name")
     if bid:
         focus = {"bottle_id": int(bid), "full_name": full}
 
-    df_question = _looks_like_df_analytics_question(user_text)
+    plan = gemini_make_df_query_plan(user_text, df, focus=focus)
+    
 
-    # 1) Planner-first (soft)
-    try:
-        if not should_skip_planner(user_text):
-            plan = gemini_make_df_query_plan(user_text, df, focus=focus)
-            plan = enforce_palette_free_text(plan, user_text)
-
-            if plan and isinstance(plan, dict):
-                if "order_by'" in plan and "order_by" not in plan:
-                    plan["order_by"] = plan.pop("order_by'")
-
-                try:
-                    plan = normalize_plan_columns(plan, df)
-                except Exception:
-                    pass
-
-                res = execute_df_query_plan(df, plan)
-
-                # ✅ return ONLY if meaningful
-                if res is not None:
-                    if isinstance(res, pd.DataFrame) and not res.empty:
-                        return format_df_answer(res, plan)  # או _df_to_telegram_text(res)
-                    if isinstance(res, pd.Series) and not res.empty:
-                        return _df_to_telegram_text(res.to_frame().T)
-
-                # ❗ אם זו שאלה אנליטית — אל תיפול לגנרי
-                if df_question:
-                    return None
-
-    except Exception as e:
-        logging.warning(f"DF plan execution failed: {e}")
-        if df_question:
-            return None
-
-    # 2) Free-text fallback ONLY when it's NOT an analytics/DF question
-    if not df_question:
+    if plan and isinstance(plan, dict):
         try:
-            return await gemini_fallback_answer(user_text, df)
+            res = execute_df_query_plan(df, plan)
+            return _df_to_telegram_text(res)
         except Exception as e:
-            logging.warning(f"Gemini fallback failed: {e}")
-            return None
-
-    return None
+            logging.warning(f"DF plan execution failed: {e}")
+            # fall through to natural-language fallback
+    # final fallback: free text answer (still grounded by schema sample)
+    try:
+        return await gemini_fallback_answer(user_text, df)
+    except Exception as e:
+        logging.warning(f"Gemini fallback failed: {e}")
+        return None
+    
 
     
 _ALLOWED_OPS = {"eq","ne","lt","lte","gt","gte","contains","in","is_null","not_null"}
@@ -3290,23 +3158,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if df is None:
         df = pd.DataFrame()
 
-
     fast = _try_fast_portfolio_answer(user_text, df)
     if fast:
         await update.message.reply_text(fast)
         return
-
-
+    
     # 2) Fresh data for deterministic intents
     try:
         df = get_all_data_as_df()
         active_df = df[df["stock_status_per"] > 0].copy()
 
-
-
-        # 2) Legacy handlers (מה שעבד לך פעם)
-        # - have_query / find_best_bottle_match / recommend וכו'
-        # ...
+        if looks_like_text_intent(user_text):
+            plan = gemini_make_df_query_plan(user_text, active_df, focus=_get_focus_bottle_row(active_df,context))
+            if plan:
+                logging.info("DF PLAN: %s", plan)
+                plan = normalize_plan_columns(plan, active_df)  # אם תוסיף (להלן)
+                res_df = execute_df_query_plan(active_df, plan) # חייב לתמוך contains + OR/AND
+                if res_df is not None and not res_df.empty:
+                    await update.message.reply_text(format_df_answer(res_df, plan))
+                    return
         
         # ===========================
         # Bottle-specific: flavors / casks (MUST be before Gemini df_query)
@@ -3439,7 +3309,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if reply:
                 await update.message.reply_text(reply)
                 return
-
 
         if _looks_like_popular_query(user_text):
             # Flexible scope via Gemini planner (e.g., "most popular of M&H")
@@ -3896,10 +3765,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
             return
         
-        # 0) hard rules (שתיתי/הוספה/תמונה וכו') נשארים כרגיל
-        # ...
-
-
         # --- FINAL: Gemini as the default engine (Option 2) ---
         df = get_all_data_as_df()
 
