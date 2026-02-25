@@ -304,7 +304,7 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     query = f"""
     SELECT t1.*,
            t2.final_smoky_sweet_score, t2.final_richness_score,
-           t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.predicted_finish_date, t3.Best_Before
+           t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.predicted_finish_date, t3.latest_consumption_time, t3.Best_Before
     FROM `{TABLE_REF}` t1
     LEFT JOIN `{VIEW_REF}` t2 ON t1.bottle_name = t2.bottle_name AND t1.distillery = t2.distillery
     LEFT JOIN `{FORECAST_TABLE_REF}` t3 ON t1.bottle_id = t3.bottle_id
@@ -766,10 +766,7 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         sep = "━━━━━━━━━━━━━━━━━━"
         lines = []
         n = min(3, len(rows))
-        if 'מתוקים' in title or 'מעושנים' in title:
-            max_score = max_score
-        elif 'עשירים/סמיכים' in title or 'עדינים' in title:
-            max_score = max_2
+
             
         for idx in range(n):
             r = rows.iloc[idx]
@@ -847,7 +844,7 @@ def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFra
         rows, err = _top_rows("final_richness_score", ascending=False, k=3)  # high = richest
         if err:
             return err
-       
+
         return _pretty_top3(
             title="🥃 טופ 3 הבקבוקים הכי עשירים/סמיכים אצלך",
             metric_label="מדד עדין↔עשיר",
@@ -1081,7 +1078,94 @@ def _extract_entity_for_have(text: str) -> str:
 
 def _looks_like_update(text: str) -> bool:
     t = _normalize_text(text)
+    # שאלות מידע שמכילות מילות עדכון אבל הן לא עדכון
+    if re.search(r"^מתי\b", t):
+        return False
+    if re.search(r"\b(לאחרונה|אחרון|last time|when did|מתי שתיתי|history)\b", t):
+        return False
     return any(h in t for h in _UPDATE_HINTS)
+
+
+# ==========================================
+# History time-range query (bottles I drank in last N days)
+# ==========================================
+
+def _looks_like_history_timerange_query(text: str) -> bool:
+    """
+    Detects queries like:
+    - "איזה בקבוקים שתיתי מהם בשבוע האחרון?"
+    - "מה שתיתי ב-10 ימים האחרונים?"
+    - "אילו בקבוקים שתיתי בחודש האחרון?"
+    """
+    t = _normalize_text(text)
+    has_drink = bool(re.search(r"(שתיתי|טעמתי|שתה)", t))
+    has_time  = bool(re.search(
+        r"(שבוע\s*האחרון|חודש\s*האחרון|\d+\s*ימים?\s*אחרונים?|ימים?\s*האחרונים?|"
+        r"last\s*\d*\s*(day|week|month|days|weeks)|בשבוע|בחודש)", t))
+    return has_drink and has_time
+
+
+def _extract_days_from_timerange(text: str) -> int:
+    """
+    Extracts number of days from time-range expressions.
+    - "שבוע אחרון" -> 7
+    - "חודש אחרון" -> 30
+    - "10 ימים אחרונים" -> 10
+    - "last 5 days" -> 5
+    - "last week" -> 7
+    - "last month" -> 30
+    """
+    t = _normalize_text(text)
+
+    # explicit number of days: "10 ימים" / "10 days"
+    m = re.search(r"(\d+)\s*(ימים?|days?)", t)
+    if m:
+        return int(m.group(1))
+
+    # week
+    if re.search(r"(שבוע|week)", t):
+        return 7
+
+    # month
+    if re.search(r"(חודש|month)", t):
+        return 30
+
+    # fallback
+    return 7
+
+
+def query_bottles_drunk_in_last_n_days(n_days: int) -> list[str]:
+    """
+    Queries HISTORY_TABLE_REF for unique bottle_names drunk in the last n_days.
+    Returns a sorted list of unique bottle_name strings.
+    """
+    query = f"""
+    SELECT DISTINCT t1.bottle_name
+    FROM `{HISTORY_TABLE_REF}` h
+    JOIN `{TABLE_REF}` t1 ON h.bottle_id = t1.bottle_id
+    WHERE h.update_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(n_days)} DAY)
+      AND t1.bottle_name IS NOT NULL
+    ORDER BY t1.bottle_name
+    """
+    df_res = bq_client.query(query).to_dataframe()
+    if df_res.empty or "bottle_name" not in df_res.columns:
+        return []
+    return df_res["bottle_name"].dropna().astype(str).tolist()
+
+
+def build_history_timerange_reply(n_days: int, bottles: list[str]) -> str:
+    sep = "━━━━━━━━━━━━━━━━━━"
+    if not bottles:
+        return f"{sep}\n🗓️ ב-{n_days} הימים האחרונים\n{sep}\n\nלא שתיתי בקבוקים בתקופה זו 🤷"
+
+    lines = "\n".join([f"🥃 {b}" for b in bottles])
+    return (
+        f"{sep}\n"
+        f"🗓️ בקבוקים ששתיתי ב-{n_days} הימים האחרונים\n"
+        f"{sep}\n\n"
+        f"{lines}\n\n"
+        f"סה\"כ: {len(bottles)} בקבוקים שונים"
+    )
 
 def _extract_amount_ml(text: str) -> int | None:
     """
@@ -2672,43 +2756,107 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
         schema = build_df_schema_context(df)
         COLUMN_GLOSSARY = {
             "avg_consumption_vol_per_day": [
-                "ממוצע שתייה", "כמה אני שותה ממנו בממוצע", "בממוצע", "popular", "פופולריות", "כמה נשתה", "צריכה יומית", "ml ליום"
+                "ממוצע שתייה", "כמה אני שותה ממנו בממוצע", "בממוצע יומי",
+                "popular", "פופולריות", "כמה נשתה", "צריכה יומית", "ml ליום",
+                "average consumption", "avg consumption", "daily consumption"
             ],
             "latest_consumption_time": [
-                "  ממנו לאחרונה", "מתי  לאחרונה", "פעם אחרונה", "last drink", "אחרון", "תאריך שתייה אחרון"
+                "מתי שתיתי ממנו לאחרונה", "מתי שתיתי ממנו",
+                "מתי טעמתי ממנו לאחרונה", "מתי טעמתי ממנו",
+                "ממנו לאחרונה", "מתי לאחרונה", "שתיתי ממנו לאחרונה",
+                "פעם אחרונה", "שתייה אחרונה", "תאריך שתייה אחרון",
+                "last drink", "last time", "last tasted", "last consumed",
+                "when did i last", "most recent drink", "אחרון"
             ],
             "predicted_finish_date": [
-                "מתי הוא צפוי להיגמר", "מתי ייגמר", "יסתיים", "finish date", "מתי נגמר"
+                "מתי הוא צפוי להיגמר", "מתי ייגמר", "מתי יגמר",
+                "מתי הבקבוק ייגמר", "מתי יסתיים", "יסתיים",
+                "finish date", "predicted finish", "מתי נגמר",
+                "צפי גמר", "מתי ייגמר הבקבוק"
             ],
             "est_consumption_date": [
-                "מתי לשתות ממנו", "מתי כדאי לשתות", "המלצה מתי לשתות", "recommend date", "דראם הבא מתי", "מה לשתות עכשיו"
+                "מתי לשתות ממנו", "מתי כדאי לשתות", "המלצה מתי לשתות",
+                "recommend date", "דראם הבא מתי", "מה לשתות עכשיו",
+                "מתי כדאי לפתוח", "est consumption", "estimated date"
             ],
             "Best_Before": [
-                "עד מתי כדאי לשתות אותו", "עד מתי כדאי לשתות ממנו", "best before", "תוקף", "מומלץ עד", "לפני שיתחמצן"
+                "עד מתי כדאי לשתות אותו", "עד מתי כדאי לשתות ממנו",
+                "best before", "תוקף", "מומלץ עד", "לפני שיתחמצן",
+                "עד מתי", "תאריך תפוגה", "oxidation", "חמצון"
             ],
             "orignal_volume": [
-                "מה הנפח שלו", "כמה ml", "נפח", "volume", "700", "1000", "גודל בקבוק"
+                "מה הנפח שלו", "כמה ml בבקבוק", "נפח הבקבוק", "נפח",
+                "volume", "גודל בקבוק", "original volume",
+                "700ml", "1000ml", "700", "1000", "כמה מ\"ל"
             ],
-            # בונוסים שימושיים:
-            "current_status": ["כמה נשאר", "אחוז נשאר", "remaining", "left", "סטוק", "מלאי"],
-            "alcohol_percentage": ["אלכוהול אחוז", "abv", "strength", "אלכוהול"],
-            "age": ["גיל", "בן כמה", "age statement"],
-            "price": ["מחיר", "כמה עלה", "עלות", "₪"],
-            "casks_aged_in": ["חבית", "חביות", "cask", "aged in"],
-            "nose": ["nose", "נוז", "ארומות", "ריח"],
-            "palette": ["palate", "פלטה", "טעמים", "taste"]
+            "current_status": [
+                "כמה נשאר", "כמה נשאר ממנו", "אחוז שנשאר", "אחוז נשאר",
+                "remaining", "left", "סטוק", "מלאי",
+                "how much left", "how much is left", "percent left",
+                "כמה יש ממנו", "כמה יש לי ממנו"
+            ],
+            "alcohol_percentage": [
+                "אלכוהול", "אחוז אלכוהול", "abv", "strength",
+                "כמה אחוז", "כמה אלכוהול", "alcohol percentage",
+                "how strong", "proof"
+            ],
+            "age": [
+                "גיל", "בן כמה", "כמה שנים", "age statement",
+                "aged", "how old", "ישן כמה שנים", "שנות יישון"
+            ],
+            "price": [
+                "מחיר", "כמה עלה", "עלות", "₪", "שקל", "שקלים",
+                "price", "cost", "how much did it cost", "כמה שילמתי"
+            ],
+            "casks_aged_in": [
+                "חבית", "חביות", "cask", "aged in", "יישון",
+                "בחבית", "שרי", "sherry", "bourbon", "בורבון",
+                "oloroso", "pedro ximenez", "oak", "עץ"
+            ],
+            "nose": [
+                "nose", "נוז", "ארומות", "ריח", "ריחות",
+                "aroma", "aromas", "smell", "sniff"
+            ],
+            "palette": [
+                "palate", "פלטה", "טעמים", "טעם", "taste",
+                "flavors", "flavours", "flavor profile"
+            ],
         }
-        
-        
+
+        # ── דטרמיניסטי: מזהים hint_column לפני שGemini מחליט ──
+        def _resolve_hint_column(text: str, glossary: dict) -> str | None:
+            t = re.sub(r"\s+", " ", text.strip().lower())
+            best_col, best_len = None, 0
+            for col, keywords in glossary.items():
+                for kw in keywords:
+                    kw_norm = re.sub(r"\s+", " ", kw.strip().lower())
+                    if kw_norm and kw_norm in t and len(kw_norm) > best_len:
+                        best_col, best_len = col, len(kw_norm)
+            return best_col
+
+        hint_col = _resolve_hint_column(user_text, COLUMN_GLOSSARY)
+
+        GLOSSARY_TEST = {
+            "latest_consumption_time": [
+                "מתי שתיתי ממנו לאחרונה", "מתי שתיתי ממנו",
+                "מתי טעמתי ממנו לאחרונה", "ממנו לאחרונה", "מתי לאחרונה",
+                "שתיתי ממנו לאחרונה", "פעם אחרונה", "שתייה אחרונה",
+                "תאריך שתייה אחרון", "last drink", "last time", "אחרון"
+            ],
+        }        
+        print(_resolve_hint_column("מתי שתיתי ממנו לאחרונה?", GLOSSARY_TEST))
+        print(_resolve_hint_column("מתי שתיתי ממנו?", GLOSSARY_TEST))        
         system = (
             "You convert user questions into a STRICT JSON query plan over a pandas DataFrame.\n"
             "Return JSON ONLY.\n"
             "You MUST use only columns that exist in the provided schema.\n"
             "Never write SQL.\n\n"
 
-            "COLUMN SELECTION RULES (VERY IMPORTANT):\n"
-            "You are given a COLUMN_GLOSSARY that maps user intents/synonyms to specific columns.\n"
-            "When the question matches a glossary entry, you MUST use the mapped column.\n"
+            "COLUMN SELECTION RULES (CRITICAL — HIGHEST PRIORITY):\n"
+            "You are given a COLUMN_GLOSSARY that maps user intents/synonyms to exact column names.\n"
+            "You are also given hint_column: if it is not null, you MUST use it as the primary select column. No exceptions.\n"
+            "Even if you think another column is more relevant, if hint_column is set — use it.\n"
+            "The glossary was resolved deterministically before you were called. Trust it completely.\n"
             "Prefer the most specific column available (e.g., predicted_finish_date vs est_consumption_date).\n"
             "If the user asks a direct 'field question', put that column in `select`.\n"
             "If the user asks 'how many' or asks for an aggregate, use `aggregations`.\n\n"
@@ -2768,7 +2916,8 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
             "message": user_text,
             "focus": focus,
             "schema": schema,
-            "column_glossary": COLUMN_GLOSSARY,   # <-- חדש ומאוד חשוב
+            "column_glossary": COLUMN_GLOSSARY,
+            "hint_column": hint_col,   # דטרמיניסטי — Gemini חייב להשתמש בזה אם לא None
             "output_schema": {
                 "action": "df_query",
                 "need_clarification": False,
@@ -3950,6 +4099,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if reply:
                 await update.message.reply_text(reply)
                 return
+
+        # 2b-pre) History time-range query: "אילו בקבוקים שתיתי ב-X ימים האחרונים?"
+        if _looks_like_history_timerange_query(user_text):
+            n_days = _extract_days_from_timerange(user_text)
+            try:
+                bottles = query_bottles_drunk_in_last_n_days(n_days)
+                reply = build_history_timerange_reply(n_days, bottles)
+            except Exception as e:
+                logging.warning(f"History time-range query failed: {e}")
+                reply = "❌ לא הצלחתי לשלוף את ההיסטוריה. נסה שוב."
+            await update.message.reply_text(reply)
+            return
 
         # 2b) Update query: fuzzy bottle + confirmation when not exact
         if _looks_like_update(user_text):
