@@ -386,8 +386,12 @@ import ast
 import re
 
 def normalize_to_list(x):
+    import numpy as np
     if x is None:
         return []
+    # numpy array (BigQuery REPEATED columns come as ndarray via pandas)
+    if isinstance(x, np.ndarray):
+        return [str(v).strip() for v in x.tolist() if str(v).strip()]
     if isinstance(x, list):
         out = []
         for v in x:
@@ -1080,19 +1084,130 @@ def _looks_like_update(text: str) -> bool:
     return any(h in t for h in _UPDATE_HINTS)
 
 def _extract_amount_ml(text: str) -> int | None:
-    # try: "60ml", "60 ml", "60מ״ל", "60 מ\"ל", "60 מ״ל"
+    """
+    Returns ml amount from text.
+    If only glass/dram count given (e.g. '2 כוסות'), converts to ml (x30).
+    If nothing found -> returns None (caller will use default 30ml / 1 dram).
+    """
     t = text.replace("מ״ל", "ml").replace('מ"ל', "ml").replace("מ''ל", "ml")
+
+    # explicit ml amount: "60ml", "60 ml"
     m = re.search(r"(\d{1,4})\s*(ml)\b", t, flags=re.IGNORECASE)
     if m:
         return int(m.group(1))
-    # maybe just a number after verbs
+
+    # glass/dram count: "2 כוסות", "3 דראמים", "2 glasses", "2 drams"
+    m_glasses = re.search(
+        r"(\d{1,2})\s*(כוס(?:ות)?|דראם(?:ים)?|glass(?:es)?|dram(?:s)?)",
+        t, flags=re.IGNORECASE
+    )
+    if m_glasses:
+        return int(m_glasses.group(1)) * 30
+
+    # bare number (not a year, not an age)
     m2 = re.search(r"\b(\d{1,4})\b", t)
     if m2:
-        # heuristic: ignore years (>=1900)
         n = int(m2.group(1))
         if n < 1900:
             return n
+
     return None
+
+
+def _extract_glass_count(text: str, amount_ml: int) -> int:
+    """
+    Returns number of drams/glasses to log in drams_counter.
+    Priority:
+      1. Explicit glass/dram count in text ("2 כוסות", "3 דראמים")
+      2. Derive from ml: round(amount_ml / 30), min 1
+      3. Default: 1
+    """
+    t = text.replace("מ״ל", "ml").replace('מ"ל', "ml").replace("מ''ל", "ml")
+
+    m = re.search(
+        r"(\d{1,2})\s*(כוס(?:ות)?|דראם(?:ים)?|glass(?:es)?|dram(?:s)?)",
+        t, flags=re.IGNORECASE
+    )
+    if m:
+        return max(1, int(m.group(1)))
+
+    return max(1, round(amount_ml / 30))
+
+def _extract_palette_from_text(text: str) -> list[str] | None:
+    """
+    Extracts palette/taste flavors from text if the user mentioned tasting notes.
+    Trigger keywords: טעימה, טעמתי, טעם, טעמים, palate, palette, taste, flavor, פלט
+    Returns a list of flavor strings, or None if not mentioned.
+    Example: "שתיתי 60ml, טעימה: chocolate, coffee, citrus" -> ["chocolate","coffee","citrus"]
+    """
+    t = text
+
+    # Find trigger keyword and capture everything after it
+    m = re.search(
+        r"(?:טעימה|טעמתי|טעמים|טעם|palate|palette|taste|flavor|פלט)\s*[:\-–]?\s*(.+?)(?:\.|$|\n|ארומה|nose|אחוז|abv|%)",
+        t, flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+
+    raw = m.group(1).strip()
+    if not raw:
+        return None
+
+    # Split by common separators: comma, slash, semicolon, Hebrew ו
+    parts = re.split(r"[,/;]+|\bו\b", raw)
+    result = [p.strip().strip("'\".,") for p in parts if p.strip()]
+    return result if result else None
+
+
+def _extract_nose_from_text(text: str) -> list[str] | None:
+    """
+    Extracts nose/aroma notes from text if the user mentioned aromas.
+    Trigger keywords: ארומה, ריח, נוז, nose, aroma
+    Returns a list of aroma strings, or None if not mentioned.
+    Example: "ארומה: vanilla, honey, oak" -> ["vanilla","honey","oak"]
+    """
+    t = text
+
+    m = re.search(
+        r"(?:ארומה|ריח|נוז|nose|aroma)\s*[:\-–]?\s*(.+?)(?:\.|$|\n|טעימה|palate|palette|אחוז|abv|%)",
+        t, flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+
+    raw = m.group(1).strip()
+    if not raw:
+        return None
+
+    parts = re.split(r"[,/;]+|\bו\b", raw)
+    result = [p.strip().strip("'\".,") for p in parts if p.strip()]
+    return result if result else None
+
+
+def _extract_abv_from_text(text: str) -> float | None:
+    """
+    Extracts a new ABV percentage from text if the user mentioned it.
+    Patterns: "50% אלכוהול", "ABV 46", "עומד על 43%", "אחוז אלכוהול 46"
+    Returns float or None if not mentioned.
+    """
+    t = text
+
+    patterns = [
+        r"(\d{2,3}(?:\.\d)?)\s*%\s*(?:אלכוהול|alc|abv)",
+        r"(?:abv|אלכוהול|alc)\s*[:\-–]?\s*(\d{2,3}(?:\.\d)?)\s*%?",
+        r"עומד על\s+(\d{2,3}(?:\.\d)?)\s*%",
+        r"אחוז אלכוהול\s+(\d{2,3}(?:\.\d)?)",
+    ]
+    for p in patterns:
+        m = re.search(p, t, flags=re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            # sanity: ABV must be between 20 and 95
+            if 20.0 <= val <= 95.0:
+                return val
+    return None
+
 
 def _extract_entity_for_count(text: str) -> str:
     """
@@ -1270,6 +1385,32 @@ _TEXT_SEARCH_INTENT_RE = re.compile(
     r"(בטעם|בטעמי|טעם|טעמים|ארומה|ארומות|ריח|נוז|nose|aroma|palate|palette|taste|flavor|חבית|חביות|יישון|cask|casks|aged|שרי|sherry)",
     re.IGNORECASE
 )    
+
+_FOCUS_BACK_PRONOUNS_RE = re.compile(
+    r"\b(הוא|בו|בה|אותו|אותה|עליו|עליה|שלו|שלה|זה|הזה|הבקבוק הזה)\b",
+    re.IGNORECASE
+)
+
+def _is_general_portfolio_query(user_text: str) -> bool:
+    """
+    Returns True if this looks like a general portfolio question
+    (filtering all bottles by flavor/cask/etc.) — NOT a follow-up
+    about the last specific bottle.
+
+    Logic:
+    - Must match looks_like_text_intent (has flavor/cask keywords)
+    - Must NOT contain focus-back pronouns (הוא / בו / שלו / זה...)
+    - Must NOT contain a specific bottle name from the DB
+      (we can't check DB here, so we use a simple heuristic:
+       if no pronoun and looks_like_text_intent -> treat as general)
+    """
+    if not looks_like_text_intent(user_text):
+        return False
+    # if the text has a pronoun pointing back to a focus bottle -> not general
+    if _FOCUS_BACK_PRONOUNS_RE.search(user_text or ""):
+        return False
+    return True
+
 
 def looks_like_text_intent(user_text: str) -> bool:
     return bool(_TEXT_SEARCH_INTENT_RE.search(user_text or ""))
@@ -1841,7 +1982,15 @@ def find_best_bottle_match(search_term: str, active_df: pd.DataFrame):
 # ==========================================
 # Update execution
 # ==========================================
-def execute_drink_update(bottle_id: int, amount_ml: int, inventory_dict: dict):
+def execute_drink_update(
+    bottle_id: int,
+    amount_ml: int,
+    inventory_dict: dict,
+    glasses_cnt: int = 1,
+    new_palette: list | None = None,
+    new_nose: list | None = None,
+    new_abv: float | None = None,
+):
     if bottle_id not in inventory_dict:
         return False, "❌ לא מצאתי את ה-ID הזה במלאי."
 
@@ -1849,46 +1998,120 @@ def execute_drink_update(bottle_id: int, amount_ml: int, inventory_dict: dict):
     vol = b_data["vol"] or 700
     drank_per = (amount_ml / vol) * 100
     new_stock_per = round(max(b_data["stock"] - drank_per, 0), 2)
-    is_empty = "true" if new_stock_per == 0 else "false"
+    is_empty = str(new_stock_per == 0.0).lower()
 
-    # currently we only update stock here; flavor updates can be added later
-    f_nose = b_data["old_nose"]
-    f_palette = b_data["old_palette"]
-    f_abv = b_data["old_abv"]
+    # ── Palette: use new if provided, else keep old ──
+    f_palette = normalize_to_list(new_palette) if new_palette else normalize_to_list(b_data["old_palette"])
+
+    # ── Nose: use new if provided, else keep old ──
+    f_nose = normalize_to_list(new_nose) if new_nose else normalize_to_list(b_data["old_nose"])
+
+    # ── ABV: validate — can only go down ──
+    old_abv = float(b_data["old_abv"]) if b_data["old_abv"] else 0.0
+    if new_abv is not None:
+        if new_abv >= old_abv:
+            return False, (
+                f"⚠️ לא ניתן לעדכן אחוז אלכוהול גבוה יותר!\n"
+                f"הערך הנוכחי הוא {old_abv}% — הערך שהזנת ({new_abv}%) גבוה ממנו או שווה לו.\n"
+                f"אלכוהול רק יורד עם הזמן. תבדוק שוב את הערך."
+            )
+        f_abv = new_abv
+    else:
+        f_abv = old_abv
+
+    safe_name   = _escape_sql_str(b_data["name"])
+    sql_nose    = sql_array(f_nose)
+    sql_palette = sql_array(f_palette)
 
     sql = f"""
-    BEGIN
-        UPDATE `{TABLE_REF}`
-        SET stock_status_per = {new_stock_per},
-            full_or_empy = {is_empty},
-            updating_time = CURRENT_TIMESTAMP(),
-            nose = {sql_array(normalize_to_list(f_nose))},
-            palette = {sql_array(normalize_to_list(f_palette))},
-            alcohol_percentage = {f_abv}
-        WHERE bottle_id = {bottle_id};
+    -- ===== DECLARES FIRST =====
+    DECLARE upd_ts TIMESTAMP;
+    DECLARE upd_date DATE;
+    DECLARE consumption_match BOOL;
+    DECLARE forecasted_bid INT64;
+    DECLARE depletion_match BOOL;
+    DECLARE consumption_flag_str STRING;
+    DECLARE depletion_flag_str STRING;
 
-        INSERT INTO `{HISTORY_TABLE_REF}`
-          (update_id, bottle_id, bottle_name, stock_status_per, update_time, drams_counter, nose, palette, alc_pre)
-        VALUES (
-          (SELECT COALESCE(MAX(update_id), 0) + 1 FROM `{HISTORY_TABLE_REF}`),
-          {bottle_id},
-          '{_escape_sql_str(b_data["name"])}',
-          {new_stock_per},
-          CURRENT_TIMESTAMP(),
-          {round(amount_ml / 30)},
-          {sql_array(f_nose)},
-          {sql_array(f_palette)},
-          {f_abv}
+    -- ===== SET =====
+    SET upd_ts   = CURRENT_TIMESTAMP();
+    SET upd_date = DATE(upd_ts);
+
+    SET consumption_match = EXISTS (
+        SELECT 1 FROM `{FORECAST_TABLE_REF}`
+        WHERE DATE(est_consumption_date) = upd_date
+        LIMIT 1
+    );
+    SET forecasted_bid = (
+        SELECT bottle_id FROM `{FORECAST_TABLE_REF}`
+        WHERE DATE(est_consumption_date) = upd_date
+        LIMIT 1
+    );
+
+    SET depletion_match = FALSE;
+    IF {new_stock_per} = 0 THEN
+        SET depletion_match = EXISTS (
+            SELECT 1 FROM `{FORECAST_TABLE_REF}`
+            WHERE DATE(predicted_finish_date) = upd_date
+            LIMIT 1
         );
-    END;
+    END IF;
+
+    SET consumption_flag_str = IF(consumption_match, 'True', 'False');
+    SET depletion_flag_str   = IF(depletion_match,  'True', 'False');
+
+    -- ===== UPDATE MAIN TABLE =====
+    UPDATE `{TABLE_REF}`
+    SET stock_status_per  = {new_stock_per},
+        full_or_empy      = {is_empty},
+        updating_time     = upd_ts
+    WHERE bottle_id = {bottle_id};
+
+    -- ===== INSERT HISTORY =====
+    INSERT INTO `{HISTORY_TABLE_REF}`
+    (
+        update_id, bottle_id, bottle_name, stock_status_per,
+        update_time, drams_counter, nose, palette, alc_pre,
+        consumption_flag, depletion_flag, forecasted_bottle_id
+    )
+    VALUES (
+        (SELECT COALESCE(MAX(update_id), 0) + 1 FROM `{HISTORY_TABLE_REF}`),
+        {bottle_id},
+        '{safe_name}',
+        {new_stock_per},
+        upd_ts,
+        {glasses_cnt},
+        {sql_nose},
+        {sql_palette},
+        {f_abv},
+        consumption_flag_str,
+        depletion_flag_str,
+        IF(consumption_match, forecasted_bid, NULL)
+    );
     """
-    bq_client.query(sql).result()
+
+    job_config = bigquery.QueryJobConfig(use_legacy_sql=False)
+    bq_client.query(sql, job_config=job_config).result()
 
     # invalidate cache
     global CACHE_DATA
     CACHE_DATA["df"] = None
 
-    return True, f"✅ עדכון בוצע!\n🥃 {b_data['name']}\n📉 ירד ל-{new_stock_per}% (הפחתה של ~{round(drank_per, 2)}%)"
+    # ── Build confirmation message ──
+    lines = [
+        f"✅ עדכון בוצע!",
+        f"🥃 {b_data['name']}",
+        f"📉 ירד ל-{new_stock_per}% (הפחתה של ~{round(drank_per, 2)}%)",
+        f"🥃 דראמים שנרשמו: {glasses_cnt}",
+    ]
+    if new_palette:
+        lines.append(f"🍫 Palette עודכן: {', '.join(f_palette)}")
+    if new_nose:
+        lines.append(f"👃 Nose עודכן: {', '.join(f_nose)}")
+    if new_abv is not None:
+        lines.append(f"🔢 ABV עודכן: {f_abv}%")
+
+    return True, "\n".join(lines)
 
 
 # ==========================================
@@ -2520,10 +2743,13 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
             "By default, select ONLY the minimal columns needed to answer the question (usually 1-3 columns).\n"
             "If the user asks a single metric (ABV, age, price, volume, last drink date, predicted finish, best before, avg consumption), select exactly that column.\n\n"
 
-            "FOCUS RULES (VERY IMPORTANT):\n"
-            "If focus.bottle_id is provided OR the user uses pronouns like 'שלו/הוא/זה/בו', "
-            "you MUST add a filter on bottle_id == focus.bottle_id. "
-            "If bottle_id is missing from schema, filter by full_name contains focus.full_name.\n\n"
+            "FOCUS RULES (CRITICAL — READ IN ORDER):\n"
+            "Rule 1: If focus_bottle is None → do NOT filter by bottle_id. Answer for the ENTIRE collection.\n"
+            "Rule 2: If focus_bottle is provided AND the user uses pronouns (שלו/הוא/זה/בו/עליו/אותו) "
+            "→ add a filter: bottle_id == focus.bottle_id.\n"
+            "Rule 3: If focus_bottle is provided BUT the question contains no pronouns "
+            "(e.g. 'which bottles have Chocolate flavor?') → IGNORE the focus. Answer for the ENTIRE collection.\n"
+            "Rule 4: If bottle_id is missing from schema, filter by full_name contains focus.full_name.\n\n"
 
             "Counting rule:\n"
             "When the user asks how many bottles (or Hebrew like כמה בקבוקי/כמה בקבוקים), "
@@ -3097,16 +3323,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             inventory_dict = {}
             for _, r in active_df.iterrows():
+
                 inventory_dict[int(r["bottle_id"])] = {
                     "name": r["full_name"],
                     "stock": float(r["stock_status_per"]),
                     "vol": float(r["orignal_volume"]) if pd.notnull(r.get("orignal_volume")) else 700.0,
-                    "old_nose": list(r["nose"]) if isinstance(r.get("nose"), list) else [],
-                    "old_palette": list(r["palette"]) if isinstance(r.get("palette"), list) else [],
+                    "old_nose": normalize_to_list(r.get("nose")),
+                    "old_palette": normalize_to_list(r.get("palette")),
                     "old_abv": float(r["alcohol_percentage"]) if pd.notnull(r.get("alcohol_percentage")) else 0.0,
                 }
 
-            ok, msg = execute_drink_update(int(pending["bottle_id"]), int(pending["amount_ml"]), inventory_dict)
+            glasses_cnt = int(pending.get("glasses_cnt") or max(1, round(int(pending["amount_ml"]) / 30)))
+            ok, msg = execute_drink_update(
+                int(pending["bottle_id"]),
+                int(pending["amount_ml"]),
+                inventory_dict,
+                glasses_cnt,
+                pending.get("new_palette"),
+                pending.get("new_nose"),
+                pending.get("new_abv"),
+            )
             _set_focus_bottle(context, {'bottle_id': int(pending['bottle_id']), 'full_name': pending.get('full_name','')})
             context.user_data.pop("pending_update", None)
             context.user_data.pop("pending_count", None)
@@ -3169,14 +3405,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_df = df[df["stock_status_per"] > 0].copy()
 
         if looks_like_text_intent(user_text):
-            plan = gemini_make_df_query_plan(user_text, active_df, focus=_get_focus_bottle_row(active_df,context))
+            # ───────────────────────────────────────────────────────────────
+            # KEY FIX: if this looks like a GENERAL portfolio query
+            # (e.g. "which bottles have Chocolate flavor?"), we must NOT
+            # pass the focus bottle to Gemini — otherwise Gemini will
+            # filter by the last specific bottle instead of the whole collection.
+            # We only pass focus when the user is asking a follow-up about
+            # a specific bottle (detected by pronouns: הוא/בו/שלו/זה...).
+            # ───────────────────────────────────────────────────────────────
+            if _is_general_portfolio_query(user_text):
+                # General query — NO focus passed to Gemini
+                plan = gemini_make_df_query_plan(user_text, active_df, focus=None)
+            else:
+                # Follow-up about a specific bottle — pass focus
+                plan = gemini_make_df_query_plan(user_text, active_df, focus=_get_focus_bottle_row(active_df, context))
+
             if plan:
                 logging.info("DF PLAN: %s", plan)
-                plan = normalize_plan_columns(plan, active_df)  # אם תוסיף (להלן)
-                res_df = execute_df_query_plan(active_df, plan) # חייב לתמוך contains + OR/AND
+                plan = normalize_plan_columns(plan, active_df)
+                res_df = execute_df_query_plan(active_df, plan)
                 if res_df is not None and not res_df.empty:
+                    # For general queries: also CLEAR focus so next question starts fresh
+                    if _is_general_portfolio_query(user_text):
+                        _clear_focus(context)
                     await update.message.reply_text(format_df_answer(res_df, plan))
                     return
+
         
         # ===========================
         # Bottle-specific: flavors / casks (MUST be before Gemini df_query)
@@ -3700,9 +3954,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 2b) Update query: fuzzy bottle + confirmation when not exact
         if _looks_like_update(user_text):
             amount_ml = _extract_amount_ml(user_text)
+
+            # ── Default: if no amount specified, assume 1 dram = 30ml ──
             if not amount_ml or amount_ml <= 0:
-                await update.message.reply_text("כמה מ״ל שתית/מזגת? (למשל: 'שתיתי 60ml Glenfiddich 15')")
-                return
+                amount_ml = 30
+
+            glasses_cnt  = _extract_glass_count(user_text, amount_ml)
+            new_palette  = _extract_palette_from_text(user_text)
+            new_nose     = _extract_nose_from_text(user_text)
+            new_abv      = _extract_abv_from_text(user_text)
 
             ent = _extract_entity_for_update(user_text)
             ent = ent.strip()
@@ -3716,13 +3976,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             match = find_best_bottle_match(ent, active_df)
             if not match["best_name"] or match["score"] < 0.70:
-                # show top candidates anyway (3) to allow pick
                 cands = match["candidates"][:3]
                 if not cands:
                     await update.message.reply_text("לא מצאתי התאמה במלאי הפעיל. תכתוב את השם קצת יותר ברור.")
                     return
                 lines = [f"{i+1}. {c['full_name']} (score {c['score']})" for i, c in enumerate(cands)]
-                context.user_data["pending_update"] = {"amount_ml": amount_ml, "candidates": cands}
+                context.user_data["pending_update"] = {
+                    "amount_ml": amount_ml,
+                    "glasses_cnt": glasses_cnt,
+                    "new_palette": new_palette,
+                    "new_nose": new_nose,
+                    "new_abv": new_abv,
+                    "candidates": cands,
+                }
                 await update.message.reply_text(
                     "לא מצאתי התאמה חד-משמעית.\n"
                     "תבחר מספר 1-3:\n" + "\n".join(lines)
@@ -3736,8 +4002,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "name": r["full_name"],
                     "stock": float(r["stock_status_per"]),
                     "vol": float(r["orignal_volume"]) if pd.notnull(r.get("orignal_volume")) else 700.0,
-                    "old_nose": list(r["nose"]) if isinstance(r.get("nose"), list) else [],
-                    "old_palette": list(r["palette"]) if isinstance(r.get("palette"), list) else [],
+                    "old_nose": normalize_to_list(r.get("nose")),
+                    "old_palette": normalize_to_list(r.get("palette")),
                     "old_abv": float(r["alcohol_percentage"]) if pd.notnull(r.get("alcohol_percentage")) else 0.0,
                 }
 
@@ -3748,6 +4014,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _normalize_text(ent) != _normalize_text(best_name):
                 context.user_data["pending_update"] = {
                     "amount_ml": amount_ml,
+                    "glasses_cnt": glasses_cnt,
+                    "new_palette": new_palette,
+                    "new_nose": new_nose,
+                    "new_abv": new_abv,
                     "bottle_id": bottle_id,
                     "full_name": best_name,
                     "candidates": match["candidates"][:3],
@@ -3755,21 +4025,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = [f"{i+1}. {c['full_name']} (score {c['score']})" for i, c in enumerate(match["candidates"][:3])]
                 await update.message.reply_text(
                     f"התכוונת ל:\n🥃 {best_name}\n"
-                    f"לעדכן שתייה של {amount_ml}ml?\n"
+                    f"לעדכן שתייה של {amount_ml}ml ({glasses_cnt} דראמים)?\n"
                     f"ענה 'כן' כדי לעדכן, 'לא' כדי לבטל, או בחר 1-3:\n" + "\n".join(lines)
                 )
                 return
 
-            ok, msg = execute_drink_update(int(bottle_id), int(amount_ml), inventory_dict)
+            ok, msg = execute_drink_update(
+                int(bottle_id), int(amount_ml), inventory_dict,
+                glasses_cnt, new_palette, new_nose, new_abv
+            )
             _set_focus_bottle(context, {'bottle_id': int(bottle_id), 'full_name': best_name})
             await update.message.reply_text(msg)
             return
         
-        # --- FINAL: Gemini as the default engine (Option 2) ---
+       # --- FINAL: Gemini as the default engine ---
         df = get_all_data_as_df()
 
         try:
-            reply = await try_gemini_df_query_answer(user_text, df, context)
+            # Same principle as above: if this is a general portfolio query,
+            # call Gemini WITHOUT focus so it doesn't anchor on the last bottle.
+            if _is_general_portfolio_query(user_text):
+                # Temporarily clear focus just for this call
+                saved_focus_id   = context.user_data.get("focus_bottle_id")
+                saved_focus_name = context.user_data.get("focus_full_name")
+                saved_focus_dist = context.user_data.get("focus_distillery")
+                _clear_focus(context)
+                reply = await try_gemini_df_query_answer(user_text, df, context)
+                # Restore focus after the call (so bottle-level follow-ups still work)
+                # Actually for a general query we want to KEEP focus cleared.
+                # If you want to RESTORE instead, uncomment the 3 lines below:
+                # context.user_data["focus_bottle_id"]   = saved_focus_id
+                # context.user_data["focus_full_name"]   = saved_focus_name
+                # context.user_data["focus_distillery"]  = saved_focus_dist
+            else:
+                reply = await try_gemini_df_query_answer(user_text, df, context)
+
             if reply:
                 await update.message.reply_text(reply)
                 return
