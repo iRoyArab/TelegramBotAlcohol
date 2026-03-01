@@ -294,6 +294,178 @@ def try_handle_focus_bottle_flavor_questions(
 
     return "".join(out).strip()
 
+
+# ══════════════════════════════════════════════════════
+#  VFM  (Value For Money) – זיהוי ומענה
+# ══════════════════════════════════════════════════════
+
+def _is_vfm_question(text: str) -> bool:
+    """
+    מזהה שאלות על VFM, לדוגמה:
+    - מה ה-VFM שלו?
+    - מה רמת ה-VFM של גלנפידיך?
+    - מי הכי VFM?
+    - מה הכי פחות VFM?
+    - מה הכי VFM ממזקקת X?
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    return bool(re.search(r"\bvfm\b", t, re.IGNORECASE))
+
+
+def _fmt_vfm_line(i: int, dist: str, bottle: str, vfm: float) -> str:
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+    dist   = (dist   or "-").strip()
+    bottle = (bottle or "-").strip()
+    return f"{medal} {dist} – {bottle}  ·  VFM: {vfm:.2f}"
+
+
+def try_handle_vfm_questions(
+    user_text: str,
+    active_df: pd.DataFrame,
+    context: ContextTypes.DEFAULT_TYPE
+) -> str | None:
+    """
+    מטפל בשלושה סוגי שאלות VFM:
+
+    1. שאלה על בקבוק בפוקוס / שם ספציפי:
+       "מה ה-VFM שלו?" / "מה ה-VFM של Glenfiddich 15?"
+    2. שאלה כללית על כל האוסף:
+       "מי הכי VFM?" / "מה הכי פחות VFM?"
+    3. שאלה על קבוצה (focus_list / מזקקה / שתיתי לאחרונה):
+       "מה הכי VFM ממזקקת Ardbeg?" / "מה הכי VFM מהבקבוקים ששתיתי לאחרונה?"
+    """
+    if not user_text:
+        return None
+
+    t = user_text.strip().lower()
+
+    # ── סוג 1: בקבוק ספציפי / פוקוס ──
+    # כולל ביטויי גוף שלישי (שלו / הוא / זה / בו / עליו) או "מה ה-VFM של <name>"
+    is_focus_query = bool(re.search(r"\b(שלו|הוא|שלה|בו|עליו|זה|שלהם)\b", t)) or \
+                     bool(re.search(r"(vfm\s*(של|ל))\b", t, re.IGNORECASE))
+
+    # ── סוג 2: הכי / הכי פחות VFM (כללי) ──
+    want_best  = bool(re.search(r"(הכי\s*vfm|vfm\s*הכי\s*גבוה|הכי\s*שווה\s*כסף|best\s*vfm)", t, re.IGNORECASE))
+    want_worst = bool(re.search(r"(הכי\s*פחות\s*vfm|vfm\s*הכי\s*נמוך|worst\s*vfm|הכי\s*פחות\s*שווה)", t, re.IGNORECASE))
+
+    sep = "━━━━━━━━━━━━━━━━━━"
+
+    if active_df is None or active_df.empty:
+        return "אין לי נתונים כרגע."
+
+    if "rvfm" not in active_df.columns:
+        return "⚠️ עמודת rvfm לא נמצאה בנתונים."
+
+    df_vfm = active_df.copy()
+    df_vfm["rvfm"] = pd.to_numeric(df_vfm["rvfm"], errors="coerce")
+    df_vfm = df_vfm.dropna(subset=["rvfm"])
+
+    if df_vfm.empty:
+        return "⚠️ אין ערכי VFM תקינים בנתונים."
+
+    # ─── סוג 1: פוקוס / שם ספציפי ───
+    if is_focus_query and not want_best and not want_worst:
+        row = _get_focus_bottle_row(active_df, context)
+        if row is None:
+            row = find_best_bottle_match(user_text, active_df)
+            if isinstance(row, dict):
+                # find_best_bottle_match מחזירה dict עם candidates
+                candidates = row.get("candidates", [])
+                if candidates and float(row.get("score", 0)) >= 0.6:
+                    bid = candidates[0]["bottle_id"]
+                    hit = active_df[active_df["bottle_id"] == bid]
+                    row = hit.iloc[0] if not hit.empty else None
+                else:
+                    row = None
+
+        if row is None:
+            return "על איזה בקבוק מדובר? כתוב שם בקבוק/מזקקה, או שאל קודם שאלה שמחזירה בקבוק."
+
+        vfm_val = pd.to_numeric(row.get("rvfm"), errors="coerce")
+        if pd.isna(vfm_val):
+            dist   = str(row.get("distillery") or "-")
+            bottle = str(row.get("bottle_name") or row.get("full_name") or "-")
+            return f"⚠️ אין ערך VFM זמין עבור {dist} – {bottle}."
+
+        dist   = str(row.get("distillery") or "-").strip()
+        bottle = str(row.get("bottle_name") or row.get("full_name") or "-").strip()
+
+        # פרשנות איכותית לפי סקאלה 1-10
+        if vfm_val >= 8.01:
+            verdict = "🟢 מחיר מציאה – חובה לרכוש!"
+        elif vfm_val >= 6.501:
+            verdict = "🟢 מחיר סבבה  – רכישה מומלצת"
+        elif vfm_val >= 5.01:
+            verdict = "🟡 מחיר הוגן – ממוצע בסדר"
+        elif vfm_val >= 3.0:
+            verdict = "🟠 יקר, אך שווה יחסית – לשקול בכובד ראש"
+        else:
+            verdict = "🔴 לא שווה בכלל – לא מומלץ לרכישה"
+
+        return (
+            f"{sep}\n💰 VFM – ערך לכסף\n{sep}\n\n"
+            f"{dist} – {bottle}\n\n"
+            f"📊 ציון VFM: {vfm_val:.2f} / 10\n"
+            f"{verdict}\n\n"
+            f"ℹ️ סקאלה: 1–3 לא שווה · 3–5 יקר · 5–6.5 הוגן · 6.5–8 שווה · 8–10 מציאה"
+        )
+
+    # ─── סוג 2 / 3: הכי / הכי פחות ───
+    if not want_best and not want_worst:
+        return None
+
+    # האם יש focus_list שרלוונטי לשאלה?
+    working_df = df_vfm
+    scope_label = "כל האוסף שלך"
+
+    list_df = _get_focus_list_df(active_df, context)
+    if list_df is not None and not list_df.empty and _is_list_followup(user_text):
+        list_df["rvfm"] = pd.to_numeric(list_df["rvfm"], errors="coerce")
+        working_df  = list_df.dropna(subset=["rvfm"])
+        scope_label = f"בקבוקי {context.user_data.get('focus_list_label', 'הרשימה')}"
+
+    if working_df.empty:
+        return "⚠️ אין ערכי VFM תקינים בקבוצה המבוקשת."
+
+    k = 3
+    if want_best:
+        top = working_df.nlargest(k, "rvfm")
+        title = f"💰 טופ {k} הכי שווי כסף – {scope_label}"
+        hint  = "🟢 גבוה יותר = שווה כסף יותר"
+    else:
+        top = working_df.nsmallest(k, "rvfm")
+        title = f"💸 טופ {k} הכי פחות שווי כסף – {scope_label}"
+        hint  = "🔴 נמוך יותר = יקר יחסית לאיכות"
+
+    avg_vfm = float(df_vfm["rvfm"].mean())
+    lines = []
+    for i, (_, r) in enumerate(top.iterrows(), start=1):
+        vfm_val = float(r["rvfm"])
+        if vfm_val >= 8.01:
+            tag = "🟢 מציאה"
+        elif vfm_val >= 6.501:
+            tag = "🟢 שווה"
+        elif vfm_val >= 5.01:
+            tag = "🟡 הוגן"
+        elif vfm_val >= 3.0:
+            tag = "🟠 יקר יחסית"
+        else:
+            tag = "🔴 לא שווה"
+        lines.append(
+            f"{_fmt_vfm_line(i, str(r.get('distillery', '-')), str(r.get('bottle_name', '-')), vfm_val)}  ({tag})"
+        )
+
+    return (
+        f"{sep}\n{title}\n{sep}\n\n"
+        + "\n".join(lines)
+        + f"\n\n📌 ממוצע VFM באוסף: {avg_vfm:.2f} / 10\n"
+        + hint
+        + "\nℹ️ סקאלה: 1–3 לא שווה · 3–5 יקר · 5–6.5 הוגן · 6.5–8 שווה · 8–10 מציאה"
+    )
+
+
 def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     global CACHE_DATA
     if (
@@ -308,6 +480,7 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     SELECT t1.*,
            t2.final_smoky_sweet_score, t2.final_richness_score,
            t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.predicted_finish_date, t3.latest_consumption_time, t3.Best_Before,
+           t3.rvfm,
        COALESCE(t4_exact.total_volume_consumed, t4_latest.total_volume_consumed) AS total_volume_consumed,
        COALESCE(t4_exact.total_drams, t4_latest.total_drams)                     AS total_drams
 
@@ -3710,6 +3883,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ans:
                 await update.message.reply_text(ans)
                 return
+
+        # C) VFM questions – focus bottle / general / group
+        if _is_vfm_question(user_text):
+            ans = try_handle_vfm_questions(user_text, df, context)
+            if ans:
+                await update.message.reply_text(ans)
+                return
+
         # A) Flavors of a bottle
         if _looks_like_flavors_of_bottle_query(user_text):
             term = user_text
