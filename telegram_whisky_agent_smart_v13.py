@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v40"
+BOT_VERSION = "v41"
 import time
 import re
 import json
@@ -935,9 +935,13 @@ _LIST_FOLLOWUP_TRIGGERS = (
     "מה מ", "מי מ", "איזה מ", "איזה מהם", "איזה מאלו",
     "from them", "from those", "among them", "of those", "of them",
     "which of", "which one",
-    # group extreme follow-ups (ממוקדם, אלכוהולי וכו' אחרי שנשמר focus_list)
-    "מביניהם הכי", "הכי vfm", "הכי אלכוהולי", "הכי ממוקדם", "הכי מוקדם",
-    "נשאר הכי קצת", "הכי מעט", "עומד להסתיים",
+    # group extreme follow-ups — רק עם כינוי scope מפורש (מביניהם/מהם/מאלו)
+    # "הכי vfm" לבד ללא כינוי scope לא אמור להיחשב follow-up על רשימה
+    "מביניהם הכי",
+    "הכי vfm מביניהם", "הכי vfm מהם", "הכי vfm מאלו",
+    "הכי אלכוהולי מביניהם", "הכי אלכוהולי מהם",
+    "הכי ממוקדם מביניהם", "הכי מוקדם מביניהם",
+    "נשאר הכי קצת מביניהם", "הכי מעט מביניהם", "עומד להסתיים מביניהם",
 )
 
 def _is_list_followup(user_text: str) -> bool:
