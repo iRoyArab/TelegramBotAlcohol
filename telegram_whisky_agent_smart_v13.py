@@ -1,8 +1,11 @@
 import logging
+
+BOT_VERSION = "v40"
 import time
 import re
 import json
 import uuid
+import ast
 from datetime import datetime, date
 import pandas as pd
 from telegram import Update
@@ -51,8 +54,6 @@ bq_client = bigquery.Client.from_service_account_json(SERVICE_ACCOUNT_FILE, proj
 # מנגנון Cache (DF) + הבאת נתונים
 # ==========================================
 CACHE_DATA = {"df": None, "last_update": 0}
-
-import re
 
 STOPWORDS = set([
     "איזה","אילו","יש","לי","תן","תביא","כל","שלי","בבקשה",
@@ -119,8 +120,6 @@ RICHNESS_RANGES = {
     'Very Rich': (12.51, 17.5),
     'Syrup Like': (17.51, 100.0)
 }
-
-import re
 
 def _is_extremes_question(text: str) -> bool:
     """
@@ -393,11 +392,11 @@ def try_handle_vfm_questions(
         bottle = str(row.get("bottle_name") or row.get("full_name") or "-").strip()
 
         # פרשנות איכותית לפי סקאלה 1-10
-        if vfm_val >= 8.01:
+        if vfm_val >= 9.5:
             verdict = "🟢 מחיר מציאה – חובה לרכוש!"
-        elif vfm_val >= 6.501:
+        elif vfm_val >= 7.201:
             verdict = "🟢 מחיר סבבה  – רכישה מומלצת"
-        elif vfm_val >= 5.01:
+        elif vfm_val >= 6.01:
             verdict = "🟡 מחיר הוגן – ממוצע בסדר"
         elif vfm_val >= 3.0:
             verdict = "🟠 יקר, אך שווה יחסית – לשקול בכובד ראש"
@@ -409,7 +408,7 @@ def try_handle_vfm_questions(
             f"{dist} – {bottle}\n\n"
             f"📊 ציון VFM: {vfm_val:.2f} / 10\n"
             f"{verdict}\n\n"
-            f"ℹ️ סקאלה: 1–3 לא שווה · 3–5 יקר · 5–6.5 הוגן · 6.5–8 שווה · 8–10 מציאה"
+            f"ℹ️ סקאלה: 9.5–10 מציאה · 7.2–9.5 שווה · 6–7.2 הוגן · 3–6 יקר · 1–3 לא שווה"
         )
 
     # ─── סוג 2 / 3: הכי / הכי פחות ───
@@ -425,6 +424,11 @@ def try_handle_vfm_questions(
         list_df["rvfm"] = pd.to_numeric(list_df["rvfm"], errors="coerce")
         working_df  = list_df.dropna(subset=["rvfm"])
         scope_label = f"בקבוקי {context.user_data.get('focus_list_label', 'הרשימה')}"
+    else:
+        dist_scope = _extract_distillery_scope_from_extremes(user_text, df_vfm)
+        if dist_scope is not None and not dist_scope.empty:
+            working_df  = dist_scope
+            scope_label = f"בקבוקי {str(dist_scope['distillery'].iloc[0])}"
 
     if working_df.empty:
         return "⚠️ אין ערכי VFM תקינים בקבוצה המבוקשת."
@@ -443,13 +447,13 @@ def try_handle_vfm_questions(
     lines = []
     for i, (_, r) in enumerate(top.iterrows(), start=1):
         vfm_val = float(r["rvfm"])
-        if vfm_val >= 8.01:
+        if vfm_val > 9.5:
             tag = "🟢 מציאה"
-        elif vfm_val >= 6.501:
+        elif vfm_val > 7.2:
             tag = "🟢 שווה"
-        elif vfm_val >= 5.01:
+        elif vfm_val > 6:
             tag = "🟡 הוגן"
-        elif vfm_val >= 3.0:
+        elif vfm_val > 3:
             tag = "🟠 יקר יחסית"
         else:
             tag = "🔴 לא שווה"
@@ -466,6 +470,149 @@ def try_handle_vfm_questions(
     )
 
 
+
+# ==========================================
+# Group Extremes: VFM / Best Before / Stock / ABV on distillery/focus-list scope
+# Examples:
+#   "מי מביניהם הכי VFM?"
+#   "מה מביניהם מומלץ לשתות הכי ממוקדם?"
+#   "באיזה בקבוק מבין Glenmorangie נשאר הכי קצת?"
+#   "מה מבין M&H הכי אלכוהולי?"
+# ==========================================
+
+_GROUP_VFM_RE = re.compile(r"\b(vfm|שווי?\s*כסף|value\s*for\s*money)\b", re.IGNORECASE)
+_GROUP_BEST_BEFORE_RE = re.compile(
+    r"(best\s*before|ממוקדם|הכי\s*מוקדם|לשתות\s*(?:הכי\s*)?בקרוב|פג\s*תוקף|מתי\s*להספיק)",
+    re.IGNORECASE
+)
+_GROUP_STOCK_LOW_RE = re.compile(
+    r"(נשאר\s*הכי\s*קצת|הכי\s*(?:מעט|קצת|ריק|כמעט\s*נגמר)|עומד\s*להסתיים|"
+    r"least\s*(?:remaining|left)|almost\s*(?:empty|gone)|מלאי\s*הכי\s*(?:נמוך|קטן|דל))",
+    re.IGNORECASE
+)
+_GROUP_ABV_MAX_RE = re.compile(
+    r"(הכי\s*אלכוהולי|הכי\s*(?:חזק|גבוה).*abv|abv.*הכי\s*(?:גבוה|חזק)|highest\s*abv|most\s*alcohol|אחוז\s*אלכוהול\s*הכי\s*גבוה)",
+    re.IGNORECASE
+)
+
+
+def _detect_group_extreme_intent(user_text: str) -> str | None:
+    if _GROUP_VFM_RE.search(user_text):
+        return "vfm"
+    if _GROUP_BEST_BEFORE_RE.search(user_text):
+        return "best_before"
+    if _GROUP_STOCK_LOW_RE.search(user_text):
+        return "stock_low"
+    if _GROUP_ABV_MAX_RE.search(user_text):
+        return "abv_max"
+    return None
+
+
+def try_handle_group_extremes(user_text: str, scope_df: "pd.DataFrame", scope_label: str) -> "str | None":
+    if scope_df is None or scope_df.empty:
+        return None
+    intent = _detect_group_extreme_intent(user_text)
+    if not intent:
+        return None
+    sep = "━━━━━━━━━━━━━━━━━━"
+
+    if intent == "vfm":
+        df_w = scope_df.copy()
+        if "rvfm" not in df_w.columns:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין ערכי VFM זמינים."
+        df_w["rvfm"] = pd.to_numeric(df_w["rvfm"], errors="coerce")
+        df_w = df_w.dropna(subset=["rvfm"])
+        if df_w.empty:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין ערכי VFM זמינים לקבוצה זו."
+        top = df_w.nlargest(3, "rvfm")
+        lines = []
+        for i, (_, r) in enumerate(top.iterrows(), start=1):
+            v = float(r["rvfm"])
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            name = str(r.get("full_name") or r.get("bottle_name") or "-")
+            tag = ("🟢 מציאה" if v >= 8.01 else "🟢 שווה" if v >= 6.501 else
+                   "🟡 הוגן" if v >= 5.01 else "🟠 יקר יחסית" if v >= 3.0 else "🔴 לא שווה")
+            lines.append(f"{medal} {name}  ·  VFM: {v:.2f}  ({tag})")
+        return (f"{sep}\n💰 הכי שווי כסף – {scope_label}\n{sep}\n\n" +
+                "\n".join(lines) +
+                "\n\nℹ️ סקאלה: 1–3 לא שווה · 3–5 יקר · 5–6.5 הוגן · 6.5–8 שווה · 8–10 מציאה")
+
+    if intent == "best_before":
+        df_w = scope_df.copy()
+        if "Best_Before" not in df_w.columns:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין שדה Best Before."
+        df_w["_bb_dt"] = df_w["Best_Before"].apply(_safe_to_datetime)
+        df_w = df_w.dropna(subset=["_bb_dt"])
+        if df_w.empty:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין ערכי Best Before זמינים."
+        df_w = df_w.sort_values("_bb_dt")
+        top = df_w.head(3)
+        today = pd.Timestamp.now(tz=None).normalize()
+        lines = []
+        for i, (_, r) in enumerate(top.iterrows(), start=1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            name = str(r.get("full_name") or r.get("bottle_name") or "-")
+            bb_date = r["_bb_dt"].normalize()
+            days = int((bb_date - today).days)
+            urgency = ("⚠️ עבר!" if days < 0 else "🔴 דחוף!" if days <= 14 else
+                       "🟠 בקרוב" if days <= 60 else "🟡 עוד זמן")
+            lines.append(f"{medal} {name}\n    📅 {str(bb_date.date())} · עוד {days} ימים {urgency}")
+        return (f"{sep}\n⏳ הכי ממוקדם לשתייה – {scope_label}\n{sep}\n\n" +
+                "\n".join(lines))
+
+    if intent == "stock_low":
+        df_w = scope_df.copy()
+        if "stock_status_per" not in df_w.columns:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין נתוני מלאי."
+        df_w["_per"] = pd.to_numeric(df_w["stock_status_per"], errors="coerce")
+        df_w = df_w.dropna(subset=["_per"])
+        df_w = df_w[df_w["_per"] > 0]
+        if df_w.empty:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין נתוני מלאי זמינים."
+        top = df_w.nsmallest(3, "_per")
+        lines = []
+        for i, (_, r) in enumerate(top.iterrows(), start=1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            name = str(r.get("full_name") or r.get("bottle_name") or "-")
+            per = float(r["_per"])
+            vol = None
+            try:
+                v = r.get("orignal_volume")
+                if pd.notnull(v):
+                    vol = float(v)
+            except Exception:
+                pass
+            ml_str = f"  (~{round((per/100)*vol)}ml)" if vol else ""
+            pfd = _fmt_date(r.get("predicted_finish_date"))
+            pfd_str = f"\n    📅 צפי סיום: {pfd}" if pfd else ""
+            urgency = ("🔴 כמעט נגמר!" if per <= 10 else "🟠 מעט נשאר" if per <= 25 else "🟡 חצי")
+            lines.append(f"{medal} {name}\n    📊 נשאר: {round(per, 1)}%{ml_str} {urgency}{pfd_str}")
+        return (f"{sep}\n📉 הכי מעט נשאר – {scope_label}\n{sep}\n\n" +
+                "\n".join(lines))
+
+    if intent == "abv_max":
+        df_w = scope_df.copy()
+        if "alcohol_percentage" not in df_w.columns:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין נתוני ABV."
+        df_w["_abv"] = pd.to_numeric(df_w["alcohol_percentage"], errors="coerce")
+        df_w = df_w.dropna(subset=["_abv"])
+        if df_w.empty:
+            return f"📋 מתוך בקבוקי {scope_label}\n⚠️ אין נתוני ABV זמינים."
+        top = df_w.nlargest(3, "_abv")
+        lines = []
+        for i, (_, r) in enumerate(top.iterrows(), start=1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            name = str(r.get("full_name") or r.get("bottle_name") or "-")
+            abv = float(r["_abv"])
+            tag = ("🔥 Cask Strength" if abv >= 55 else "💪 חזק" if abv >= 46 else "✅ סטנדרטי")
+            lines.append(f"{medal} {name}  ·  {abv:.1f}%  {tag}")
+        return (f"{sep}\n🔥 הכי אלכוהולי – {scope_label}\n{sep}\n\n" +
+                "\n".join(lines) +
+                "\n\nℹ️ <46% סטנדרטי · 46–55% חזק · 55%+ Cask Strength")
+
+    return None
+
+
 def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     global CACHE_DATA
     if (
@@ -479,7 +626,7 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     query = f"""
     SELECT t1.*,
            t2.final_smoky_sweet_score, t2.final_richness_score,
-           t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.predicted_finish_date, t3.latest_consumption_time, t3.Best_Before,
+           t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.avg_days_between_updates, t3.predicted_finish_date, t3.latest_consumption_time, t3.Best_Before,
            t3.rvfm,
        COALESCE(t4_exact.total_volume_consumed, t4_latest.total_volume_consumed) AS total_volume_consumed,
        COALESCE(t4_exact.total_drams, t4_latest.total_drams)                     AS total_drams
@@ -571,9 +718,6 @@ def get_forecast_current_status_map(force_refresh: bool = False) -> dict:
         return {}
 
 
-
-import ast
-import re
 
 def normalize_to_list(x):
     import numpy as np
@@ -791,6 +935,9 @@ _LIST_FOLLOWUP_TRIGGERS = (
     "מה מ", "מי מ", "איזה מ", "איזה מהם", "איזה מאלו",
     "from them", "from those", "among them", "of those", "of them",
     "which of", "which one",
+    # group extreme follow-ups (ממוקדם, אלכוהולי וכו' אחרי שנשמר focus_list)
+    "מביניהם הכי", "הכי vfm", "הכי אלכוהולי", "הכי ממוקדם", "הכי מוקדם",
+    "נשאר הכי קצת", "הכי מעט", "עומד להסתיים",
 )
 
 def _is_list_followup(user_text: str) -> bool:
@@ -934,8 +1081,43 @@ def _looks_like_count_query(text: str) -> bool:
     t = _normalize_text(text)
     return any(h in t for h in _COUNT_HINTS) and (any(h in t for h in _BOTTLE_HINTS) or any(h in t for h in _HAVE_HINTS))
 
-import re
-import pandas as pd
+
+# ── Extremes-on-distillery: "מה הכי מתוק מבקבוקי Glenfiddich" ──
+_EXTREMES_GROUP_SCOPE_RE = re.compile(
+    r"(מ(?:בקבוקי|בקבוקים\s*של|ביניהם|אלו|הם|בקוקי|קבוקי|קבוקים)|"
+    r"מה(?:בקבוקים|בקבוקי)\s*של|"
+    r"בקבוק\s+\w|"                          # "מה הבקבוק Glenmorangie הכי..."
+    r"של\s+מזקקת?|from\s+(?:the\s+)?bottles?\s+of|among\s+(?:the\s+)?)",
+    re.IGNORECASE
+)
+
+def _extract_distillery_scope_from_extremes(user_text: str, active_df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    אם שאלת extremes מציינת מזקקה ספציפית (למשל "מה הכי מתוק מבקבוקי M&H"),
+    מחזיר DataFrame מסונן לאותה מזקקה.
+    מחזיר None אם לא זוהתה מזקקה ספציפית.
+    """
+    if not _EXTREMES_GROUP_SCOPE_RE.search(user_text):
+        return None
+
+    # נסה fuzzy match על שם מזקקה בטקסט
+    # קודם ננקה מילי "הכי מתוק / מעושן" כדי לקבל שם מזקקה נקי
+    clean = re.sub(
+        r"(מה|הכי|מתוק|מעושן|עדין|עשיר|סמיך|מ(?:בקבוקי|בקבוקים|ביניהם|אלו)|"
+        r"שלי|של|ה|בקבוק|בקבוקי|sweet|smoky|delicate|rich|\?|!)",
+        " ", user_text, flags=re.IGNORECASE
+    )
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return None
+
+    dist_match = find_best_distillery_match(clean, active_df)
+    if dist_match.get("best") and float(dist_match.get("score") or 0) >= 0.60:
+        dist = dist_match["best"]
+        sub = active_df[active_df["distillery"].astype(str) == str(dist)]
+        return sub if not sub.empty else None
+    return None
+
 
 def try_handle_extremes_sweet_smoky_rich_delicate(user_text: str, df: pd.DataFrame) -> str | None:
     """
@@ -1821,13 +2003,6 @@ def _safe_to_datetime(x):
 # Add New Bottle via Telegram Photo (AI Scan)
 # ==========================================
 
-_ADD_BOTTLE_HINTS = (
-    "הוסף בקבוק חדש", "אני רוצה להוסיף בקבוק", "בקבוק חדש",
-    "add new bottle", "add bottle", "new bottle"
-)
-
-_FOCUS_PLACEHOLDERS = ("בו", "בה", "זה", "אותו", "אותה", "שלו", "שלה", "it", "this", "that")
-
 def _looks_like_add_bottle(text: str) -> bool:
     t = _normalize_text(text)
     triggers = (
@@ -1994,8 +2169,6 @@ def _format_add_summary(p: dict) -> str:
     if "was_a_gift" in p:
         lines.append(f"Was a gift: {p.get('was_a_gift')}")
     return "\n".join(lines)
-
-import re
 
 def _extract_quoted_tokens(s: str) -> list[str]:
     """
@@ -2645,11 +2818,6 @@ async def gemini_fallback_answer(user_text: str, df: pd.DataFrame) -> str:
         logging.warning(f"Gemini fallback failed: {e}")
         return "לא הצלחתי להבין לגמרי את הבקשה. תנסה לנסח אחרת 🙏"    
 
-import json
-import re
-import pandas as pd
-
-
 
 
 # ---- Gemini Router: decides df_query vs intent vs smalltalk ----
@@ -3084,16 +3252,6 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
 
         hint_col = _resolve_hint_column(user_text, COLUMN_GLOSSARY)
 
-        GLOSSARY_TEST = {
-            "latest_consumption_time": [
-                "מתי שתיתי ממנו לאחרונה", "מתי שתיתי ממנו",
-                "מתי טעמתי ממנו לאחרונה", "ממנו לאחרונה", "מתי לאחרונה",
-                "שתיתי ממנו לאחרונה", "פעם אחרונה", "שתייה אחרונה",
-                "תאריך שתייה אחרון", "last drink", "last time", "אחרון"
-            ],
-        }        
-        print(_resolve_hint_column("מתי שתיתי ממנו לאחרונה?", GLOSSARY_TEST))
-        print(_resolve_hint_column("מתי שתיתי ממנו?", GLOSSARY_TEST))        
         system = (
             "You convert user questions into a STRICT JSON query plan over a pandas DataFrame.\n"
             "Return JSON ONLY.\n"
@@ -3233,12 +3391,6 @@ async def try_gemini_df_query_answer(user_text: str, df: pd.DataFrame, context) 
         return None
     
 
-    
-_ALLOWED_OPS = {"eq","ne","lt","lte","gt","gte","contains","in","is_null","not_null"}
-_ALLOWED_AGG = {"count","nunique","sum","avg","min","max"}
-
-    
-
 # ==========================================
 # Gemini fallback (optional)
 # ==========================================
@@ -3306,6 +3458,271 @@ def build_stock_reply(row: pd.Series) -> str:
         lines.append(f"📅 תאריך סיום חזוי (predicted_finish_date): {pfd}")
 
     return "\n".join(lines)
+
+# ==========================================
+# שאלות ספציפיות על שדה בקבוק מסוים
+# לדוגמה: "מה אחוז האלכוהול של Glenmorangie A Tale of Spices?"
+#          "מה ה-rarity של Milk & Honey Biblical Origin?"
+#          "מתי שתיתי Spey Tenne לאחרונה?"
+#          "האם Glenfiddich Project XX מתוק?"
+# ==========================================
+
+# Detect patterns like "X של <bottle>" or "האם <bottle> Y?"
+_SPECIFIC_BOTTLE_ABV_RE = re.compile(
+    r"(אחוז\s*(?:אלכוהול)?|\babv\b|alcohol\s*percentage|כמה\s*אלכוהול|\bproof\b)",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_RARITY_RE = re.compile(
+    r"\b(rarity|נדירות|נדיר|רריטי)\b",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_LAST_DRINK_RE = re.compile(
+    r"(מתי\s*שתיתי|מתי\s*טעמתי|שתיתי.*לאחרונה|last\s*time\s*i\s*drank|last\s*drink|last\s*tasted)",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_SWEETNESS_RE = re.compile(
+    r"(מתוק|מעושן|עדין|עשיר|סמיך|sweet|smoky|delicate|rich|האם.*מתוק|האם.*מעושן)",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_REMAINING_RE = re.compile(
+    r"(כמה\s*נשאר|כמה\s*%|אחוז\s*נשאר|remaining|how\s*much\s*left|left\s*in)",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_VFM_RE = re.compile(
+    r"\bvfm\b",
+    re.IGNORECASE
+)
+_SPECIFIC_BOTTLE_FREQ_RE = re.compile(
+    r"(כל\s*כמה|תדירות|באיזו\s*תדירות|how\s*often|frequency)",
+    re.IGNORECASE
+)
+
+
+def _is_specific_bottle_question(user_text: str) -> bool:
+    """
+    מזהה שאלה שמכילה שם בקבוק ספציפי + שאלה על שדה כלשהו.
+    שאלות כמו:
+    - "האם Glenfiddich Project XX מתוק?"
+    - "מה אחוז האלכוהול של Glenmorangie A Tale of Spices?"
+    - "מה ה-rarity של Milk & Honey Biblical Origin?"
+    - "מתי שתיתי Spey Tenne לאחרונה?"
+    - "מה הטעמים של M&H Under The Bridge?"
+    - "כמה נשאר ב GlenAllachie The 15th?"
+
+    שאלות עם "הכי" (extremes) נדחות — הן שייכות לloגיקת ה-extremes/group.
+    """
+    if not user_text:
+        return False
+    t = _normalize_text(user_text)
+
+    # "הכי מתוק / הכי מעושן" = extremes question, NOT a specific bottle question
+    if re.search(r"\bהכי\b", t):
+        return False
+
+    has_field_intent = bool(
+        _SPECIFIC_BOTTLE_ABV_RE.search(user_text) or
+        _SPECIFIC_BOTTLE_RARITY_RE.search(user_text) or
+        _SPECIFIC_BOTTLE_LAST_DRINK_RE.search(user_text) or
+        _SPECIFIC_BOTTLE_SWEETNESS_RE.search(user_text) or
+        _SPECIFIC_BOTTLE_REMAINING_RE.search(user_text) or
+        _SPECIFIC_BOTTLE_VFM_RE.search(user_text) or
+        _looks_like_flavors_of_bottle_query(user_text) or
+        _looks_like_age_of_bottle_query(user_text) or
+        _looks_like_oxidized_query(user_text)
+    )
+
+    if not has_field_intent:
+        return False
+
+    # Make sure it doesn't look like a pronoun-only follow-up (no specific bottle name)
+    # by checking if there's at least some non-stopword content after removing field keywords
+    clean = re.sub(
+        r"(מה|האם|מתי|כמה|שתיתי|טעמתי|אחוז|אלכוהול|abv|rarity|נדירות|נשאר|"
+        r"טעמים|הטעמים|ארומה|גיל|שנים|מתוק|מעושן|עדין|עשיר|נשאר|של|ב|לאחרונה|"
+        r"\\?|!|:|-)",
+        " ", _normalize_text(user_text), flags=re.IGNORECASE
+    )
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    # If what's left is basically a pronoun only -> not a "specific bottle" question
+    if _is_focus_placeholder(clean):
+        return False
+
+    return True
+
+
+def try_handle_specific_bottle_question(
+    user_text: str,
+    active_df: pd.DataFrame,
+    context: ContextTypes.DEFAULT_TYPE
+) -> str | None:
+    """
+    מטפל בשאלות שבהן מוזכר שם בקבוק ספציפי + שדה כלשהו.
+    מחזיר תשובה כטקסט, או None אם לא זוהה.
+    """
+    if not user_text or active_df is None or active_df.empty:
+        return None
+
+    # ── נקה את טקסט השאלה מ"מילות שאלה" לפני fuzzy match ──
+    # זה מונע מ"מה ה vfm של Glenmorangie The Lasanta" להתאים גרוע
+    _FIELD_NOISE_RE = re.compile(
+        r"(^|\s)(מה|ה|של|האם|מתי|כמה|שתיתי|טעמתי|אחוז|אלכוהול|abv|vfm|"
+        r"rarity|נדירות|נשאר|טעמים|הטעמים|ארומה|גיל|שנים|מתוק|מעושן|"
+        r"עדין|עשיר|לאחרונה|ב|את|עם|על|the|של|is|does|what|when|how|much)(\s|$)",
+        re.IGNORECASE
+    )
+    clean_for_match = _FIELD_NOISE_RE.sub(" ", user_text)
+    clean_for_match = re.sub(r"[\?\!\:\-\.\,]", " ", clean_for_match)
+    clean_for_match = re.sub(r"\s+", " ", clean_for_match).strip()
+
+    # נסה קודם עם טקסט נקי, אחר כך עם הטקסט המלא
+    match = find_best_bottle_match(clean_for_match, active_df)
+    if not match.get("best_name") or float(match.get("score") or 0) < 0.62:
+        match = find_best_bottle_match(user_text, active_df)
+    if not match.get("best_name") or float(match.get("score") or 0) < 0.62:
+        return None
+
+    chosen = (match.get("candidates") or [None])[0]
+    if not chosen or chosen.get("bottle_id") is None:
+        return None
+
+    sub = active_df[active_df["bottle_id"] == chosen["bottle_id"]]
+    if sub.empty:
+        return None
+
+    row = sub.iloc[0]
+    full_name = str(row.get("full_name") or row.get("bottle_name") or "").strip()
+    sep = "━━━━━━━━━━━━━━━━━━"
+
+    # ── קבע פוקוס ──
+    _set_focus_bottle(context, row)
+
+    # ── VFM ──
+    if _SPECIFIC_BOTTLE_VFM_RE.search(user_text):
+        vfm_val = pd.to_numeric(row.get("rvfm"), errors="coerce")
+        if pd.isna(vfm_val):
+            return f"⚠️ אין ערך VFM זמין עבור {full_name}."
+        if vfm_val >= 9.5:
+            verdict = "🟢 מחיר מציאה – חובה לרכוש!"
+        elif vfm_val >= 7.201:
+            verdict = "🟢 מחיר סבבה  – רכישה מומלצת"
+        elif vfm_val >= 6.01:
+            verdict = "🟡 מחיר הוגן – ממוצע בסדר"
+        elif vfm_val >= 3.0:
+            verdict = "🟠 יקר, אך שווה יחסית – לשקול בכובד ראש"
+        else:
+            verdict = "🔴 לא שווה בכלל – לא מומלץ לרכישה"
+        return (
+            f"{sep}\n💰 VFM – ערך לכסף\n{sep}\n\n"
+            f"{full_name}\n\n"
+            f"📊 ציון VFM: {float(vfm_val):.2f} / 10\n"
+            f"{verdict}\n\n"
+            f"ℹ️ סקאלה: 9.5–10 מציאה · 7.2–9.5 שווה · 6–7.2 הוגן · 3–6 יקר · 1–3 לא שווה"
+        )
+
+    # ── החמצון / Best Before ──
+    if _looks_like_oxidized_query(user_text):
+        bb = row.get("Best_Before")
+        bb_dt = _safe_to_datetime(bb)
+        if pd.isna(bb_dt):
+            return f"🥃 {full_name}\n⚠️ אין לי Best Before מוגדר לבקבוק הזה."
+        from datetime import datetime as _dt
+        today = _dt.now().date()
+        bb_date = bb_dt.date()
+        warning = "\n⚠️ שים לב! הבקבוק מאבד טעמים, מומלץ לסיים בהקדם!" if bb_date < today else ""
+        return (
+            f"{sep}\n🧪 סטטוס חמצון (Best Before)\n{sep}\n\n"
+            f"🥃 {full_name}\n"
+            f"📅 Best Before: {bb_date}{warning}"
+        )
+
+    # ── ABV ──
+    if _SPECIFIC_BOTTLE_ABV_RE.search(user_text):
+        abv = row.get("alcohol_percentage")
+        try:
+            abv_val = float(abv) if pd.notnull(abv) else None
+        except Exception:
+            abv_val = None
+        if abv_val is None:
+            return f"🥃 {full_name}\n⚠️ אין לי ערך ABV לבקבוק הזה."
+        return f"{sep}\n🔢 אחוז אלכוהול\n{sep}\n\n🥃 {full_name}\n💧 ABV: {abv_val}%"
+
+    # ── Rarity ──
+    if _SPECIFIC_BOTTLE_RARITY_RE.search(user_text):
+        rarity = row.get("rarity") or row.get("Rarity")
+        if rarity is None or (isinstance(rarity, float) and pd.isna(rarity)):
+            return f"🥃 {full_name}\n⚠️ אין לי ערך Rarity לבקבוק הזה."
+        return f"{sep}\n💎 Rarity\n{sep}\n\n🥃 {full_name}\n✨ Rarity: {rarity}"
+
+    # ── מתי שתיתי לאחרונה ──
+    if _SPECIFIC_BOTTLE_LAST_DRINK_RE.search(user_text):
+        last_time = row.get("latest_consumption_time")
+        dt = _safe_to_datetime(last_time)
+        if pd.isna(dt):
+            return f"🥃 {full_name}\n📅 אין לי רשומת שתייה לבקבוק הזה עדיין."
+        return (
+            f"{sep}\n🕒 שתייה אחרונה\n{sep}\n\n"
+            f"🥃 {full_name}\n"
+            f"📅 {str(dt.date())}"
+        )
+
+    # ── מתוק / מעושן / עדין / עשיר ──
+    if _SPECIFIC_BOTTLE_SWEETNESS_RE.search(user_text):
+        t = _normalize_text(user_text)
+        ask_sweet_smoky = bool(re.search(r"(מתוק|מעושן|sweet|smoky)", t))
+        ask_richness = bool(re.search(r"(עדין|עשיר|סמיך|delicate|rich)", t))
+
+        out_parts = [f"{sep}\n🧾 פרופיל בקבוק\n{sep}\n\n{full_name}\n"]
+
+        if ask_sweet_smoky:
+            s_val = _safe_float(row.get("final_smoky_sweet_score"))
+            if s_val is None:
+                out_parts.append("⚠️ אין מדד מתוק↔עשן לבקבוק הזה.")
+            else:
+                label = _label_from_ranges(s_val, SWEETNESS_RANGES)
+                out_parts.append(
+                    f"🍯 מתוק↔עשן: {s_val:.2f}\n"
+                    f"🏷️ פרופיל: {label}\n"
+                    "ℹ️ נמוך=יותר מתוק · גבוה=יותר מעושן"
+                )
+        if ask_richness:
+            r_val = _safe_float(row.get("final_richness_score"))
+            if r_val is None:
+                out_parts.append("\n⚠️ אין מדד עדין↔עשיר לבקבוק הזה.")
+            else:
+                label = _label_from_ranges(r_val, RICHNESS_RANGES)
+                out_parts.append(
+                    f"\n🌿 עדין↔עשיר: {r_val:.2f}\n"
+                    f"🏷️ פרופיל: {label}\n"
+                    "ℹ️ נמוך=יותר עדין · גבוה=יותר עשיר"
+                )
+        return "".join(out_parts).strip()
+
+    # ── כל כמה זמן שותה ──
+    if _SPECIFIC_BOTTLE_FREQ_RE.search(user_text):
+        freq = row.get("avg_days_between_updates")
+        try:
+            freq_val = float(freq) if (freq is not None and not (isinstance(freq, float) and pd.isna(freq))) else None
+        except Exception:
+            freq_val = None
+        if freq_val is None:
+            return f"{sep}\n📅 תדירות שתייה\n{sep}\n\n🥃 {full_name}\n⚠️ Missing Data!"
+        return f"{sep}\n📅 תדירות שתייה\n{sep}\n\n🥃 {full_name}\n🔄 שותה בממוצע כל {freq_val:.1f} ימים"
+
+    # ── טעמים ──
+    if _looks_like_flavors_of_bottle_query(user_text):
+        return build_flavors_reply(row)
+
+    # ── גיל ──
+    if _looks_like_age_of_bottle_query(user_text):
+        return build_age_reply(row)
+
+    # ── כמה נשאר ──
+    if _SPECIFIC_BOTTLE_REMAINING_RE.search(user_text):
+        return build_stock_reply(row)
+
+    return None
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_update", None)
@@ -3381,23 +3798,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    # ----- HARD RULE: sweet/smoky & delicate/rich extremes -----
+    # ----- HARD RULE: sweet/smoky & delicate/rich extremes + group extremes (VFM/BB/Stock/ABV) -----
     df = get_all_data_as_df()
+    active_df_ext = df[df["stock_status_per"] > 0].copy() if df is not None and not df.empty else df
 
-    # ✅ אם זו שאלת follow-up על רשימה קודמת, הפעל extremes על הסאב-DF בלבד
-    if _is_list_followup(user_text):
-        list_df = _get_focus_list_df(df, context)
-        if list_df is not None and not list_df.empty:
-            label = context.user_data.get("focus_list_label", "הרשימה")
-            ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, list_df)
-            if ans:
-                await update.message.reply_text(f"📋 מתוך בקבוקי {label}:\n\n{ans}")
-                return
+    # ── helper: scope detection (distillery or focus_list) ──
+    def _resolve_group_scope():
+        """Returns (scope_df, scope_label) or (None, None)."""
+        # 1. explicit distillery in text
+        dist_scope_df = _extract_distillery_scope_from_extremes(user_text, active_df_ext)
+        if dist_scope_df is not None and not dist_scope_df.empty:
+            dist_name = str(dist_scope_df.iloc[0].get("distillery", "המזקקה"))
+            _set_focus_list(context, dist_scope_df, label=dist_name)
+            return dist_scope_df, dist_name
+        # 2. follow-up on existing focus_list
+        if _is_list_followup(user_text):
+            ldf = _get_focus_list_df(active_df_ext, context)
+            if ldf is not None and not ldf.empty:
+                return ldf, context.user_data.get("focus_list_label", "הרשימה")
+        return None, None
 
+    # ── group extremes on a distillery scope (VFM / Best Before / Stock / ABV / sweet-smoky) ──
+    scope_df, scope_label = _resolve_group_scope()
+    if scope_df is not None:
+        # Try new group extremes handler first (VFM, BB, stock, ABV)
+        group_ans = try_handle_group_extremes(user_text, scope_df, scope_label)
+        if group_ans:
+            await update.message.reply_text(group_ans)
+            return
+        # Fallback to sweet/smoky/rich/delicate extremes on the scope
+        sweet_ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, scope_df)
+        if sweet_ans:
+            await update.message.reply_text(f"📋 מתוך בקבוקי {scope_label}:\n\n{sweet_ans}")
+            return
+
+    # ── general extremes on whole collection ──
     ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, df)
     if ans:
         await update.message.reply_text(ans)
         return    
+
+    # ----- שאלות ספציפיות על בקבוק בשם מפורש -----
+    # לדוגמה: "האם Glenfiddich Project XX מתוק?" / "מה ABV של M&H Biblical?"
+    # חייב לרוץ לפני ה-pending flows כי הוא דטרמיניסטי ומהיר,
+    # ולפני ה-flavor/cask/stock handlers כי הוא מטפל בכולם.
+    if _is_specific_bottle_question(user_text):
+        active_df_for_specific = df[df["stock_status_per"] > 0].copy() if df is not None and not df.empty else None
+        specific_df = active_df_for_specific if (active_df_for_specific is not None and not active_df_for_specific.empty) else df
+        specific_ans = try_handle_specific_bottle_question(user_text, specific_df, context)
+        if specific_ans:
+            # לטעמים ו-age נשלח עם Markdown, לשאר — plaintext
+            if _looks_like_flavors_of_bottle_query(user_text) or _looks_like_age_of_bottle_query(user_text):
+                await update.message.reply_text(specific_ans, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(specific_ans)
+            return
     
     
     # Global cancel
