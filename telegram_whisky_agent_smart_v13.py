@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v41"
+BOT_VERSION = "v48"
 import time
 import re
 import json
@@ -8,8 +8,8 @@ import uuid
 import ast
 from datetime import datetime, date
 import pandas as pd
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 from google.cloud import bigquery
@@ -629,7 +629,8 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
            t3.avg_consumption_vol_per_day, t3.est_consumption_date, t3.avg_days_between_updates, t3.predicted_finish_date, t3.latest_consumption_time, t3.Best_Before,
            t3.rvfm,
        COALESCE(t4_exact.total_volume_consumed, t4_latest.total_volume_consumed) AS total_volume_consumed,
-       COALESCE(t4_exact.total_drams, t4_latest.total_drams)                     AS total_drams
+       COALESCE(t4_exact.total_drams, t4_latest.total_drams)                     AS total_drams,
+       t5.known_drinkers
 
     FROM `{TABLE_REF}` t1
     LEFT JOIN `{VIEW_REF}` t2 ON t1.bottle_name = t2.bottle_name AND t1.distillery = t2.distillery
@@ -645,6 +646,13 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
     ) t4_latest 
         ON t1.bottle_id = t4_latest.bottle_id
         AND t4_exact.bottle_id IS NULL
+
+    LEFT JOIN (
+        SELECT ARRAY_AGG(DISTINCT d IGNORE NULLS ORDER BY d) AS known_drinkers
+        FROM `{HISTORY_TABLE_REF}`,
+        UNNEST(drinker_name) AS d
+        WHERE d IS NOT NULL AND TRIM(d) != ''
+    ) t5 ON TRUE
         """
     df = bq_client.query(query).to_dataframe()
 
@@ -1080,6 +1088,49 @@ _UPDATE_HINTS = ("שתיתי", "מזגתי", "מזיגה", "שתייה", "עדכ
 _CONFIRM_YES = ("כן", "כן.", "כן!", "יאפ", "y", "yes", "sure", "ok", "אוקיי", "אוקי")
 _CONFIRM_NO = ("לא", "לא.", "לא!", "n", "no", "nope")
 _CANCEL_WORDS = ("ביטול", "בטל", "/בטל", "cancel", "/cancel", "צא", "exit", "stop")
+
+_UPDATE_FLOW_TRIGGERS = (
+    "עדכן בקבוק", "עדכון בקבוק", "עדכן שתיה", "עדכן שתייה",
+    "update bottle", "log drink", "log dram",
+)
+
+def _looks_like_update_trigger(text: str) -> bool:
+    t = _normalize_text(text)
+    return any(_normalize_text(tr) in t for tr in _UPDATE_FLOW_TRIGGERS)
+
+def _get_update_flow(context) -> dict | None:
+    return context.user_data.get("update_flow")
+
+def _set_update_flow(context, data: dict):
+    context.user_data["update_flow"] = data
+
+def _clear_update_flow(context):
+    context.user_data.pop("update_flow", None)
+
+def _get_known_drinkers_from_df() -> list[str]:
+    """Extract distinct drinker names from the cached DF (known_drinkers column)."""
+    try:
+        df = get_all_data_as_df()
+        if df is None or df.empty or "known_drinkers" not in df.columns:
+            return []
+        val = df["known_drinkers"].dropna().iloc[0] if not df["known_drinkers"].dropna().empty else None
+        if val is None:
+            return []
+        return normalize_to_list(val)
+    except Exception as e:
+        logging.warning(f"Could not extract drinker names from DF: {e}")
+        return []
+
+def _build_drinker_keyboard(known: list[str], selected: list[str]) -> "InlineKeyboardMarkup":
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = []
+    for name in known:
+        tick = "✅" if name in selected else "◻️"
+        buttons.append([InlineKeyboardButton(f"{tick} {name}", callback_data=f"drk_toggle:{name}")])
+    buttons.append([InlineKeyboardButton("➕ הוסף שם חדש", callback_data="drk_add_new")])
+    buttons.append([InlineKeyboardButton("✔️ אישור", callback_data="drk_confirm")])
+    return InlineKeyboardMarkup(buttons)
+
 
 def _looks_like_count_query(text: str) -> bool:
     t = _normalize_text(text)
@@ -2499,6 +2550,7 @@ def execute_drink_update(
     new_palette: list | None = None,
     new_nose: list | None = None,
     new_abv: float | None = None,
+    drinkers: list | None = None,
 ):
     if bottle_id not in inventory_dict:
         return False, "❌ לא מצאתי את ה-ID הזה במלאי."
@@ -2531,6 +2583,12 @@ def execute_drink_update(
     safe_name   = _escape_sql_str(b_data["name"])
     sql_nose    = sql_array(f_nose)
     sql_palette = sql_array(f_palette)
+
+    if drinkers:
+        safe_drinker = _escape_sql_str(", ".join([str(d).strip() for d in drinkers if str(d).strip()]))
+        sql_drinker = f"'{safe_drinker}'"
+    else:
+        sql_drinker = "NULL"
 
     sql = f"""
     -- ===== DECLARES FIRST =====
@@ -2581,7 +2639,7 @@ def execute_drink_update(
     (
         update_id, bottle_id, bottle_name, stock_status_per,
         update_time, drams_counter, nose, palette, alc_pre,
-        consumption_flag, depletion_flag, forecasted_bottle_id
+        consumption_flag, depletion_flag, forecasted_bottle_id, drinker_name
     )
     VALUES (
         (SELECT COALESCE(MAX(update_id), 0) + 1 FROM `{HISTORY_TABLE_REF}`),
@@ -2595,7 +2653,8 @@ def execute_drink_update(
         {f_abv},
         consumption_flag_str,
         depletion_flag_str,
-        IF(consumption_match, forecasted_bid, NULL)
+        IF(consumption_match, forecasted_bid, NULL),
+        {sql_drinker}
     );
     """
 
@@ -2613,6 +2672,8 @@ def execute_drink_update(
         f"📉 ירד ל-{new_stock_per}% (הפחתה של ~{round(drank_per, 2)}%)",
         f"🥃 דראמים שנרשמו: {glasses_cnt}",
     ]
+    if drinkers:
+        lines.append(f"👤 שתה/ו: {', '.join(drinkers)}")
     if new_palette:
         lines.append(f"🍫 Palette עודכן: {', '.join(f_palette)}")
     if new_nose:
@@ -3131,7 +3192,13 @@ def rule_based_inventory_answer(user_text: str, df: pd.DataFrame) -> str | None:
     """
     if df is None or df.empty:
         return None
+    
+    # ✅ תמיד עבוד על בקבוקים פעילים בלבד
+    if "stock_status_per" in df.columns:
+        df = df[pd.to_numeric(df["stock_status_per"], errors="coerce").fillna(0) > 0].copy()
 
+    if df.empty:
+        return None
     if not _is_count_bottles_question(user_text) and not _is_percent_of_total_question(user_text):
         return None
 
@@ -3179,6 +3246,11 @@ def gemini_make_df_query_plan(user_text: str, df: pd.DataFrame, focus: dict | No
                 "ממוצע שתייה", "כמה אני שותה ממנו בממוצע", "בממוצע יומי",
                 "popular", "פופולריות", "כמה נשתה", "צריכה יומית", "ml ליום",
                 "average consumption", "avg consumption", "daily consumption"
+            ],
+            "avg_days_between_updates": [
+                "כל כמה זמן", "כל כמה ימים", "כל כמה שבועות",
+                "כמה זמן בין שתייה לשתייה", "תדירות שתייה", "בממוצע כל כמה",
+                "how often", "frequency", "days between", "avg days between",
             ],
             "latest_consumption_time": [
                 "מתי שתיתי ממנו לאחרונה", "מתי שתיתי ממנו",
@@ -3741,6 +3813,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "אם אני לא בטוח בשם – אציע התאמה ואבקש אישור לפני עדכון."
     )
 
+async def handle_drinker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    update_flow = _get_update_flow(context)
+    if not update_flow or update_flow.get("stage") != "await_drinker":
+        await query.edit_message_text("הפעולה פגה. כתוב 'עדכן בקבוק' מחדש.")
+        return
+
+    known    = update_flow.get("known_drinkers", [])
+    selected = update_flow.get("selected_drinkers", [])
+
+    if data.startswith("drk_toggle:"):
+        name = data[len("drk_toggle:"):]
+        if name in selected:
+            selected.remove(name)
+        else:
+            selected.append(name)
+        update_flow["selected_drinkers"] = selected
+        _set_update_flow(context, update_flow)
+        kb = _build_drinker_keyboard(known, selected)
+        await query.edit_message_reply_markup(reply_markup=kb)
+        return
+
+    if data == "drk_add_new":
+        update_flow["adding_new_drinker"] = True
+        _set_update_flow(context, update_flow)
+        await query.edit_message_text("כתוב את השם החדש:")
+        return
+
+    if data == "drk_confirm":
+        if not selected:
+            await query.answer("בחר לפחות שם אחד.", show_alert=True)
+            return
+        update_flow["drinkers"] = selected
+        update_flow["stage"] = "await_ml"
+        _set_update_flow(context, update_flow)
+        await query.edit_message_text(
+            f"נבחרו: {', '.join(selected)}\n\nכמה מ\"ל נשתה? (מספר בלבד)"
+        )
+        return
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stage-aware handler: can receive TEXT or PHOTO
     stage = _get_add_stage(context)
@@ -3864,6 +3981,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_update", None)
         context.user_data.pop("pending_count", None)
         context.user_data.pop("pending_stock", None)
+        _clear_update_flow(context)
         _clear_add_flow(context)
         await update.message.reply_text("סבבה, ביטלתי את הפעולה הקודמת. שלח שאלה חדשה 🙂")
 
@@ -4162,6 +4280,176 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     
+    # ===========================
+    # Guided Update Flow
+    # ===========================
+    update_flow = _get_update_flow(context)
+    if update_flow:
+        stage = update_flow.get("stage")
+        t_norm = _normalize_text(user_text)
+
+        if t_norm in [_normalize_text(x) for x in _CANCEL_WORDS]:
+            _clear_update_flow(context)
+            await update.message.reply_text("ביטלתי. שלח שאלה חדשה.")
+            return
+
+        if stage == "await_bottle_name":
+            df_all = get_all_data_as_df()
+            active_upd = df_all[df_all["stock_status_per"] > 0].copy()
+            match = find_best_bottle_match(user_text, active_upd)
+            if not match["best_name"] or match["score"] < 0.55:
+                await update.message.reply_text("לא מצאתי. נסה שוב (מזקקה + שם בקבוק).")
+                return
+            update_flow["bottle_id"] = match["bottle_id"]
+            update_flow["full_name"] = match["best_name"]
+            update_flow["stage"] = "await_bottle_confirm"
+            _set_update_flow(context, update_flow)
+            await update.message.reply_text(f"התכוונת ל: 🥃 {match['best_name']}? (כן / לא)")
+            return
+
+        if stage == "await_bottle_confirm":
+            if t_norm in [_normalize_text(x) for x in _CONFIRM_YES]:
+                known = _get_known_drinkers_from_df()
+                update_flow["stage"] = "await_drinker"
+                update_flow["known_drinkers"] = known
+                update_flow["selected_drinkers"] = []
+                _set_update_flow(context, update_flow)
+                if known:
+                    kb = _build_drinker_keyboard(known, [])
+                    await update.message.reply_text("מי שתה? (בחר אחד או יותר)", reply_markup=kb)
+                else:
+                    await update.message.reply_text("מי שתה? (כתוב שם)")
+                return
+            if t_norm in [_normalize_text(x) for x in _CONFIRM_NO]:
+                update_flow["stage"] = "await_bottle_name"
+                _set_update_flow(context, update_flow)
+                await update.message.reply_text("כתוב את שם הבקבוק שוב:")
+                return
+            await update.message.reply_text("ענה כן או לא.")
+            return
+
+        if stage == "await_drinker":
+            # Free-text fallback (no known drinkers, or user adding new name via text)
+            if update_flow.get("adding_new_drinker"):
+                new_name = user_text.strip()
+                if not new_name:
+                    await update.message.reply_text("כתוב שם.")
+                    return
+                selected = update_flow.get("selected_drinkers", [])
+                if new_name not in selected:
+                    selected.append(new_name)
+                update_flow["selected_drinkers"] = selected
+                update_flow.pop("adding_new_drinker", None)
+                known = update_flow.get("known_drinkers", [])
+                if known:
+                    kb = _build_drinker_keyboard(known, selected)
+                    await update.message.reply_text(f"נוסף: {new_name}\nבחר עוד או לחץ אישור:", reply_markup=kb)
+                else:
+                    # No known drinkers — go straight to ml
+                    update_flow["drinkers"] = selected
+                    update_flow["stage"] = "await_ml"
+                    _set_update_flow(context, update_flow)
+                    await update.message.reply_text("כמה מ\"ל נשתה? (מספר בלבד)")
+                return
+            # No known drinkers at all — accept free text directly
+            drinkers = [d.strip() for d in re.split(r"[,،]", user_text) if d.strip()]
+            if not drinkers:
+                await update.message.reply_text("כתוב שם שותה.")
+                return
+            update_flow["drinkers"] = drinkers
+            update_flow["stage"] = "await_ml"
+            _set_update_flow(context, update_flow)
+            await update.message.reply_text("כמה מ\"ל נשתה? (מספר בלבד)")
+            return
+
+        if stage == "await_ml":
+            m_ml = re.match(r"^\s*(\d{1,4}(?:\.\d+)?)\s*$", user_text.replace(",", "."))
+            if not m_ml or float(m_ml.group(1)) <= 0:
+                await update.message.reply_text("כתוב מספר בלבד. למשל: 60")
+                return
+            update_flow["amount_ml"] = int(float(m_ml.group(1)))
+            update_flow["stage"] = "await_glasses"
+            _set_update_flow(context, update_flow)
+            await update.message.reply_text("בכמה כוסות/דראמים? (מספר שלם)")
+            return
+
+        if stage == "await_glasses":
+            m_g = re.match(r"^\s*(\d{1,3})\s*$", user_text)
+            if not m_g or int(m_g.group(1)) <= 0:
+                await update.message.reply_text("כתוב מספר שלם גדול מ-0.")
+                return
+            update_flow["glasses_cnt"] = int(m_g.group(1))
+            update_flow["stage"] = "await_final_confirm"
+            _set_update_flow(context, update_flow)
+            await update.message.reply_text(
+                f"סיכום:\n"
+                f"🥃 {update_flow['full_name']}\n"
+                f"👤 {', '.join(update_flow.get('drinkers', []))}\n"
+                f"📏 {update_flow['amount_ml']} מ\"ל\n"
+                f"🥛 {update_flow['glasses_cnt']} כוסות\n\n"
+                f"לעדכן? (כן / לא)"
+            )
+            return
+
+        if stage == "await_final_confirm":
+            if t_norm in [_normalize_text(x) for x in _CONFIRM_YES]:
+                df_all = get_all_data_as_df()
+                active_upd = df_all[df_all["stock_status_per"] > 0].copy()
+                inventory_dict = {
+                    int(r["bottle_id"]): {
+                        "name": r["full_name"],
+                        "stock": float(r["stock_status_per"]),
+                        "vol": float(r["orignal_volume"]) if pd.notnull(r.get("orignal_volume")) else 700.0,
+                        "old_nose": normalize_to_list(r.get("nose")),
+                        "old_palette": normalize_to_list(r.get("palette")),
+                        "old_abv": float(r["alcohol_percentage"]) if pd.notnull(r.get("alcohol_percentage")) else 0.0,
+                    }
+                    for _, r in active_upd.iterrows()
+                }
+                ok, msg = execute_drink_update(
+                    int(update_flow["bottle_id"]),
+                    int(update_flow["amount_ml"]),
+                    inventory_dict,
+                    update_flow["glasses_cnt"],
+                    drinkers=update_flow.get("drinkers"),
+                )
+                _set_focus_bottle(context, {"bottle_id": int(update_flow["bottle_id"]), "full_name": update_flow.get("full_name", "")})
+                _clear_update_flow(context)
+                await update.message.reply_text(msg)
+                return
+            if t_norm in [_normalize_text(x) for x in _CONFIRM_NO]:
+                update_flow["stage"] = "await_fix_field"
+                _set_update_flow(context, update_flow)
+                await update.message.reply_text(
+                    "מה לתקן?\n1. בקבוק\n2. שותה\n3. כמות (מ\"ל)\n4. כוסות\n5. ביטול"
+                )
+                return
+            await update.message.reply_text("ענה כן או לא.")
+            return
+
+        if stage == "await_fix_field":
+            m_fix = re.match(r"^\s*([1-5])\s*$", user_text)
+            if not m_fix:
+                await update.message.reply_text("בחר 1-5.")
+                return
+            choice = int(m_fix.group(1))
+            if choice == 5:
+                _clear_update_flow(context)
+                await update.message.reply_text("ביטלתי.")
+                return
+            stage_map = {
+                1: ("await_bottle_name", "כתוב שם בקבוק:"),
+                2: ("await_drinker", "מי שתה?"),
+                3: ("await_ml", "כמה מ\"ל?"),
+                4: ("await_glasses", "כמה כוסות?"),
+            }
+            update_flow["stage"], prompt = stage_map[choice]
+            _set_update_flow(context, update_flow)
+            await update.message.reply_text(prompt)
+            return
+
+        _clear_update_flow(context)
+
 # 1) Pending confirmation flow
     pending = context.user_data.get("pending_update")
     if pending:
@@ -4461,7 +4749,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Smart analytics via Gemini DF planner (portfolio shares, flexible ratios, etc.)
         # We route percent-of-total questions here to avoid confusing them with "remaining stock" bottle questions.
         if _looks_like_portfolio_share_query(user_text):
-            reply = await try_gemini_df_query_answer(user_text, df, context)
+            reply = await try_gemini_df_query_answer(user_text, active_df, context)
             if reply:
                 await update.message.reply_text(reply)
                 return
@@ -4782,7 +5070,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # PERCENT / SHARE QUERIES (must run even without "כמה")
         # -----------------------------
         if _is_percent_of_total_question(user_text) or _looks_like_portfolio_share_query(user_text):
-            rb = rule_based_inventory_answer(user_text, df)
+            rb = rule_based_inventory_answer(user_text, active_df)
             if rb:
                 await update.message.reply_text(rb)
                 return
@@ -4797,7 +5085,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------
         if _looks_like_count_query(user_text):
             # 0) Deterministic inventory Q&A first (category/total/percent, etc.)
-            rb = rule_based_inventory_answer(user_text, df)
+            rb = rule_based_inventory_answer(user_text, active_df)
             if rb:
                 await update.message.reply_text(rb)
                 return
@@ -4851,7 +5139,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # 2) Otherwise, Gemini DF planner for flexible analytics
-            reply = await try_gemini_df_query_answer(user_text, df, context)
+            reply = await try_gemini_df_query_answer(user_text, active_df, context)
             if reply:
                 await update.message.reply_text(reply)
                 return
@@ -4893,91 +5181,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
             return
         
-        # 2b) Update query: fuzzy bottle + confirmation when not exact
-        if _looks_like_update(user_text):
-            amount_ml = _extract_amount_ml(user_text)
-
-            # ── Default: if no amount specified, assume 1 dram = 30ml ──
-            if not amount_ml or amount_ml <= 0:
-                amount_ml = 30
-
-            glasses_cnt  = _extract_glass_count(user_text, amount_ml)
-            new_palette  = _extract_palette_from_text(user_text)
-            new_nose     = _extract_nose_from_text(user_text)
-            new_abv      = _extract_abv_from_text(user_text)
-
-            ent = _extract_entity_for_update(user_text)
-            ent = ent.strip()
-            if not ent:
-                focus_row = _get_focus_bottle_row(active_df, context)
-                if focus_row is not None:
-                    ent = str(focus_row.get("full_name") or "").strip()
-                else:
-                    await update.message.reply_text("איזה בקבוק בדיוק? תכתוב מזקקה + שם/גיל (או תשאל קודם על בקבוק ואז תכתוב 'שתיתי 60ml').")
-                    return
-
-            match = find_best_bottle_match(ent, active_df)
-            if not match["best_name"] or match["score"] < 0.70:
-                cands = match["candidates"][:3]
-                if not cands:
-                    await update.message.reply_text("לא מצאתי התאמה במלאי הפעיל. תכתוב את השם קצת יותר ברור.")
-                    return
-                lines = [f"{i+1}. {c['full_name']} (score {c['score']})" for i, c in enumerate(cands)]
-                context.user_data["pending_update"] = {
-                    "amount_ml": amount_ml,
-                    "glasses_cnt": glasses_cnt,
-                    "new_palette": new_palette,
-                    "new_nose": new_nose,
-                    "new_abv": new_abv,
-                    "candidates": cands,
-                }
-                await update.message.reply_text(
-                    "לא מצאתי התאמה חד-משמעית.\n"
-                    "תבחר מספר 1-3:\n" + "\n".join(lines)
-                )
-                return
-
-            # prepare inventory dict only now
-            inventory_dict = {}
-            for _, r in active_df.iterrows():
-                inventory_dict[int(r["bottle_id"])] = {
-                    "name": r["full_name"],
-                    "stock": float(r["stock_status_per"]),
-                    "vol": float(r["orignal_volume"]) if pd.notnull(r.get("orignal_volume")) else 700.0,
-                    "old_nose": normalize_to_list(r.get("nose")),
-                    "old_palette": normalize_to_list(r.get("palette")),
-                    "old_abv": float(r["alcohol_percentage"]) if pd.notnull(r.get("alcohol_percentage")) else 0.0,
-                }
-
-            best_name = match["best_name"]
-            bottle_id = match["bottle_id"]
-
-            # REQUIREMENT: if not exact, ask before update
-            if _normalize_text(ent) != _normalize_text(best_name):
-                context.user_data["pending_update"] = {
-                    "amount_ml": amount_ml,
-                    "glasses_cnt": glasses_cnt,
-                    "new_palette": new_palette,
-                    "new_nose": new_nose,
-                    "new_abv": new_abv,
-                    "bottle_id": bottle_id,
-                    "full_name": best_name,
-                    "candidates": match["candidates"][:3],
-                }
-                lines = [f"{i+1}. {c['full_name']} (score {c['score']})" for i, c in enumerate(match["candidates"][:3])]
-                await update.message.reply_text(
-                    f"התכוונת ל:\n🥃 {best_name}\n"
-                    f"לעדכן שתייה של {amount_ml}ml ({glasses_cnt} דראמים)?\n"
-                    f"ענה 'כן' כדי לעדכן, 'לא' כדי לבטל, או בחר 1-3:\n" + "\n".join(lines)
-                )
-                return
-
-            ok, msg = execute_drink_update(
-                int(bottle_id), int(amount_ml), inventory_dict,
-                glasses_cnt, new_palette, new_nose, new_abv
-            )
-            _set_focus_bottle(context, {'bottle_id': int(bottle_id), 'full_name': best_name})
-            await update.message.reply_text(msg)
+        # 2b) Update trigger
+        if _looks_like_update_trigger(user_text):
+            _set_update_flow(context, {"stage": "await_bottle_name"})
+            await update.message.reply_text("איזה בקבוק תרצה לעדכן?")
             return
         
        # --- FINAL: Gemini as the default engine ---
@@ -5034,6 +5241,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_drinker_callback, pattern=r"^drk_"))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
