@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v48"
+BOT_VERSION = "v50"
 import time
 import re
 import json
@@ -147,7 +147,10 @@ def _is_focus_flavor_question(text: str) -> bool:
 
 
 def _normalize_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+    # Strip Unicode direction/control marks that Telegram injects into Hebrew text
+    # (e.g. \u200f = RTL mark, \u200e = LTR mark, \u202a-\u202e = embedding marks)
+    cleaned = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", (s or ""))
+    return re.sub(r"\s+", " ", cleaned.strip().lower())
 
 def _label_from_ranges(score: float, ranges_dict: dict) -> str:
     """
@@ -4413,9 +4416,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     update_flow["glasses_cnt"],
                     drinkers=update_flow.get("drinkers"),
                 )
-                _set_focus_bottle(context, {"bottle_id": int(update_flow["bottle_id"]), "full_name": update_flow.get("full_name", "")})
+                bottle_name = update_flow.get("full_name", "הבקבוק")
+                _set_focus_bottle(context, {"bottle_id": int(update_flow["bottle_id"]), "full_name": bottle_name})
                 _clear_update_flow(context)
-                await update.message.reply_text(msg)
+                if ok:
+                    await update.message.reply_text(
+                        f"{msg}\n\n"
+                        f"🎉 הבקבוק *{bottle_name}* עודכן בהצלחה!",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ העדכון של *{bottle_name}* נכשל:\n{msg}",
+                        parse_mode="Markdown"
+                    )
                 return
             if t_norm in [_normalize_text(x) for x in _CONFIRM_NO]:
                 update_flow["stage"] = "await_fix_field"
