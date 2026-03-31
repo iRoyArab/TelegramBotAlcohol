@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v50"
+BOT_VERSION = "v52"
 import time
 import re
 import json
@@ -103,12 +103,12 @@ def normalize_plan_columns(plan: dict, df) -> dict:
 
 SWEETNESS_RANGES = {
     'Very Sweet': (0, 1.5),
-    'Sweet-Citrucy': (1.51, 2.0),
-    'Citrucy-Spicy': (2.01, 2.749),
-    'Coffee Like- Sea Salt': (2.75, 4.0),
-    'Minerals - Sulfur': (4.01, 5.5),
+    'Sweet-Citrucy': (1.51, 2.6),
+    'Citrucy-Spicy': (2.61, 3.6),
+    'Coffee Like - Sea Salt': (3.61, 4.5),
+    'Minerals - Sulfur': (4.51, 5.5),
     'Ash - BBQ Smoke': (5.51, 7.5),
-    'Heavy Peat - Medicinal Smoke': (7.51, 10.0)
+    'Heavy Peat - Medicinal Smoke': (7.51, 100.0)
 }
 
 RICHNESS_RANGES = {
@@ -1145,7 +1145,9 @@ _EXTREMES_GROUP_SCOPE_RE = re.compile(
     r"(מ(?:בקבוקי|בקבוקים\s*של|ביניהם|אלו|הם|בקוקי|קבוקי|קבוקים)|"
     r"מה(?:בקבוקים|בקבוקי)\s*של|"
     r"בקבוק\s+\w|"                          # "מה הבקבוק Glenmorangie הכי..."
-    r"של\s+מזקקת?|from\s+(?:the\s+)?bottles?\s+of|among\s+(?:the\s+)?)",
+    r"של\s+מזקקת?|"
+    r"של\s+\S|"                             # "הכי מתוק של M&H / של Glenfiddich"
+    r"from\s+(?:the\s+)?bottles?\s+of|among\s+(?:the\s+)?)",
     re.IGNORECASE
 )
 
@@ -4633,6 +4635,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if _ldf is not None and not _ldf.empty:
                     _extremes_df = _ldf
                     _extremes_prefix = f"📋 מתוך בקבוקי {context.user_data.get('focus_list_label', 'הרשימה')}:\n\n"
+            else:
+                # ✅ מזקקה מוזכרת ישירות בשאלה? ("הכי מתוק של M&H")
+                _dist_df = _extract_distillery_scope_from_extremes(user_text, active_df)
+                if _dist_df is not None and not _dist_df.empty:
+                    _extremes_df = _dist_df
+                    _extremes_prefix = f"📋 מתוך בקבוקי {_dist_df.iloc[0].get('distillery', '')}:\n\n"
             ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, _extremes_df)
             if ans:
                 await update.message.reply_text(_extremes_prefix + ans)
