@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v52"
+BOT_VERSION = "v56"
 import time
 import re
 import json
@@ -636,7 +636,7 @@ def get_all_data_as_df(force_refresh: bool = False) -> pd.DataFrame:
        t5.known_drinkers
 
     FROM `{TABLE_REF}` t1
-    LEFT JOIN `{VIEW_REF}` t2 ON t1.bottle_name = t2.bottle_name AND t1.distillery = t2.distillery
+    LEFT JOIN `{VIEW_REF}` t2 ON t1.bottle_id = t2.bottle_id
     LEFT JOIN `{FORECAST_TABLE_REF}` t3 ON t1.bottle_id = t3.bottle_id
     LEFT JOIN `{CONS_REF}` as t4_exact ON t1.bottle_id =  t4_exact.bottle_id AND t3.latest_consumption_time =  t4_exact.update_date
     
@@ -2116,13 +2116,16 @@ def _unique_from_array_col(df: pd.DataFrame, col: str) -> list[str]:
             for it in x:
                 if it is None:
                     continue
-            for tok in normalize_to_list(it):
+                for tok in normalize_to_list(it):  # FIX: was outside inner loop
+                    tok = tok.strip()
+                    if tok:
+                        out.add(tok)
+        else:
+            # scalar from DB may be raw string like "['Honey']" — normalize it
+            for tok in normalize_to_list(str(x)):
+                tok = tok.strip()
                 if tok:
                     out.add(tok)
-        else:
-            s = str(x).strip()
-            if s:
-                out.add(s)
     return sorted(out)
 
 def _map_to_closest(val: str | None, options: list[str], threshold: float = 0.68) -> str | None:
@@ -2212,12 +2215,13 @@ def _format_add_summary(p: dict) -> str:
     lines.append(f"Alcohol Type: {p.get('alcohol_type','-')}")
     lines.append(f"Country: {p.get('origin_country','-')}")
     lines.append(f"Region: {p.get('region','-')}")
-    lines.append(f"Casks: {fmt_list(p.get('casks'))}")
+    lines.append(f"Casks: {fmt_list(p.get('casks_aged_in'))}")
     lines.append(f"Nose: {fmt_list(p.get('nose'))}")
-    lines.append(f"Palette: {fmt_list(p.get('palate'))}")
+    lines.append(f"Palette: {fmt_list(p.get('palette'))}")
     lines.append(f"Volume (ml): {p.get('orignal_volume','-')}")
-    lines.append(f"Special bottling: {p.get('special')}")
-    lines.append(f"Limited edition: {p.get('limited')}")
+    lines.append(f"Rarity: {p.get('rarity') or '-'}")
+    lines.append(f"Special bottling: {p.get('special_bottling')}")
+    lines.append(f"Limited edition: {p.get('limited_edition')}")
     if "price_paid" in p:
         lines.append(f"Price paid: {p.get('price_paid')}₪")
     if "price_full" in p:
@@ -2257,7 +2261,7 @@ def _normalize_vision_list(x) -> list[str]:
     if x is None:
         return []
 
-    # If already list/tuple -> flatten
+    # If already list/tuple -> flatten each element
     if isinstance(x, (list, tuple)):
         out = []
         for it in x:
@@ -2268,8 +2272,9 @@ def _normalize_vision_list(x) -> list[str]:
     if not s:
         return []
 
-    # Case: looks like bracketed list but missing commas: "['A' 'B']"
+    # Case: looks like a bracketed list (full string is "[...]")
     if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+        # First try to extract quoted tokens: "['Honey']" -> ["Honey"]
         quoted = _extract_quoted_tokens(s)
         if quoted:
             return quoted
@@ -2281,10 +2286,21 @@ def _normalize_vision_list(x) -> list[str]:
     # Normal comma/semicolon/newline separated
     if any(sep in s for sep in [",", ";", "\n"]):
         parts = re.split(r"[,;\n]+", s)
-        return [p.strip() for p in parts if p.strip()]
+        # Each part may still be a bracket-wrapped token like "['Honey']" — clean it
+        cleaned = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if (p.startswith("[") and p.endswith("]")) or (p.startswith("(") and p.endswith(")")):
+                cleaned.extend(_normalize_vision_list(p))
+            else:
+                cleaned.append(p.strip("'\""))
+        return [c for c in cleaned if c]
 
-    # Plain single token
-    return [s]
+    # Single token — strip any stray bracket/quote wrappers
+    s = s.strip("[]()").strip("'\"").strip()
+    return [s] if s else []
 
 def sanitize_scan_raw(scan: dict) -> dict:
     """
@@ -2312,7 +2328,7 @@ Your task is to analyze a whisky bottle label image and extract technical data i
 
 ### PHASE 1: DATA EXTRACTION & CALCULATION (INTERNAL LOGIC)
 1. Scan for dates: Distilled and Bottled. If no age statement exists but dates do, calculate age.
-2. Identify distillery and origin. Recognize logos (e.g. 'M&H' -> 'Milk & Honey Distillery', Israel).
+2. Identify distillery and origin. Recognize logos (e.g. 'M&H' -> 'Milk & Honey', Israel).
 3. Analyze cask type.
 4. Infer sensory profile: if missing, generate accurate keywords based on cask + distillery + climate.
 
@@ -2323,7 +2339,27 @@ Your task is to analyze a whisky bottle label image and extract technical data i
 - limited: true if 'Single Cask' or 'Small Batch'.
 - special: true if 'Distillery Exclusive' or 'Single Cask'.
 
-### PHASE 3: OUTPUT SCHEMA
+### PHASE 3: RARITY CLASSIFICATION
+Classify rarity into exactly one of these options:
+- "Core Range" — standard permanent release, widely available
+- "Limited Edition" — time-limited or seasonal release (look for "Limited Edition", "Special Release", year statements without cask number, or numbered bottles like 029/150)
+- "Small Batch" — explicitly states "Small Batch"
+- "Local Distillery Core Range" — standard release from a small/local distillery (e.g. Israeli, Taiwanese, Indian)
+- "Private Release Blend" — private bottling, blended whisky
+- "Single Cask" — single cask without specific bottler branding (look for Cask No., Butt No., Barrel No., or similar cask identifiers)
+- "Private Release Single Cask" — single cask from an independent bottler
+- "Distillery Edition Single Cask" — single cask released directly by the distillery
+
+Inference rules:
+1. If you see a cask number (e.g. "Cask No. 123", "Butt No. 5", "Barrel #42") AND a year -> "Single Cask" or "Distillery Edition Single Cask"
+2. If you see a bottle number out of total (e.g. "029/150", "Bottle 12 of 200") -> "Limited Edition" unless also a single cask
+3. If both cask number AND numbered bottles -> "Distillery Edition Single Cask"
+4. If "Small Batch" appears explicitly -> "Small Batch"
+5. If "Private" or independent bottler name appears -> "Private Release Single Cask" or "Private Release Blend"
+6. Default for unknown local distilleries -> "Local Distillery Core Range"
+7. Default for known major distilleries with no special markers -> "Core Range"
+
+### PHASE 4: OUTPUT SCHEMA
 Return a single JSON object only.
 {
   "bottle_name": string,
@@ -2339,6 +2375,7 @@ Return a single JSON object only.
   "orignal_volume": number,
   "limited": boolean,
   "special": boolean,
+  "rarity": string,
   "confidence": number
 }
 """
@@ -2360,6 +2397,17 @@ Return a single JSON object only.
         clean_text = clean_text[3:-3]
     return json.loads(clean_text)
 
+RARITY_OPTIONS = [
+    "Core Range",
+    "Limited Edition",
+    "Small Batch",
+    "Local Distillery Core Range",
+    "Private Release Blend",
+    "Single Cask",
+    "Private Release Single Cask",
+    "Distillery Edition Single Cask",
+]
+
 def _apply_controlled_vocab(scan: dict, active_df: pd.DataFrame) -> dict:
     """Map extracted strings to your existing vocab using Levenshtein."""
     out = dict(scan or {})
@@ -2371,10 +2419,19 @@ def _apply_controlled_vocab(scan: dict, active_df: pd.DataFrame) -> dict:
     casks_opts = _unique_from_array_col(active_df, "casks_aged_in")
     nose_opts = _unique_from_array_col(active_df, "nose")
     pal_opts = _unique_from_array_col(active_df, "palette")
+    dist_opts = _unique_from_scalar_col(active_df, "distillery")
 
     out["alcohol_type"] = _map_to_closest(out.get("alcohol_type"), alcohol_type_opts)
     out["origin_country"] = _map_to_closest(out.get("origin_country"), country_opts)
     out["region"] = _map_to_closest(out.get("region"), region_opts)
+
+    # Normalize distillery: prefer existing name in DB over Gemini's version
+    raw_dist = out.get("distillery")
+    if raw_dist and dist_opts:
+        mapped_dist = _map_to_closest(raw_dist, dist_opts)
+        # Only override if the match is reasonably close (Levenshtein will pick best)
+        if mapped_dist:
+            out["distillery"] = mapped_dist
 
     out["casks_aged_in"] = _map_list_to_options(normalize_to_list(out.get("casks")), casks_opts)
     out["nose"] = _map_list_to_options(normalize_to_list(out.get("nose")), nose_opts)
@@ -2383,6 +2440,19 @@ def _apply_controlled_vocab(scan: dict, active_df: pd.DataFrame) -> dict:
     # normalize booleans
     out["special_bottling"] = bool(out.get("special"))
     out["limited_edition"] = bool(out.get("limited"))
+
+    # Rarity: validate against controlled vocab; keep Gemini's value if it matches, else None
+    raw_rarity = out.get("rarity")
+    if raw_rarity and isinstance(raw_rarity, str):
+        # exact match first
+        if raw_rarity in RARITY_OPTIONS:
+            out["rarity"] = raw_rarity
+        else:
+            # fuzzy fallback to closest option
+            mapped = _map_to_closest(raw_rarity, RARITY_OPTIONS)
+            out["rarity"] = mapped if mapped else None
+    else:
+        out["rarity"] = None
 
     # keep naming consistent with main table
     out["bottle_name"] = out.get("bottle_name")
@@ -2428,6 +2498,8 @@ def insert_new_bottle_from_payload(p: dict) -> int:
 
     purch = datetime.now().date().isoformat()
 
+    val_rarity = _sql_str_or_null(p.get("rarity"))
+
     sql = f"""
     BEGIN
     DECLARE ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
@@ -2438,7 +2510,7 @@ def insert_new_bottle_from_payload(p: dict) -> int:
     limited_edition, special_bottling, was_a_gift, stock_status_per, full_or_empy,
     orignal_volume, date_of_purchase, opening_date, bottle_counter,
     was_discounted, discount_amount, discounted_price, time_of_registration,
-    updating_time)
+    updating_time, rarity)
     VALUES (
         {new_id}, {val_name}, {val_dist}, {val_type}, {val_country}, {val_region},
         {val_casks}, {val_nose}, {val_pal},
@@ -2453,7 +2525,8 @@ def insert_new_bottle_from_payload(p: dict) -> int:
         {discount_amount if discount_amount is not None else 'NULL'},
         {price_paid if price_paid is not None else 'NULL'},
         ts,
-        ts
+        ts,
+        {val_rarity}
     );
 
     INSERT INTO `{HISTORY_TABLE_REF}`
@@ -2522,7 +2595,9 @@ def find_best_bottle_match(search_term: str, active_df: pd.DataFrame):
         "best_name": full_name,
         "bottle_id": int,
         "score": float,
-        "candidates": [ {"full_name":..., "bottle_id":..., "score":...}, ... up to 5]
+        "candidates": [ {"full_name":..., "bottle_id":..., "score":...}, ... up to 5],
+        "duplicates": [ {"full_name":..., "bottle_id":..., "stock_status_per":...}, ... ]
+          -- populated when multiple distinct bottle_ids share the same best full_name
       }
     """
     term = _normalize_text(search_term)
@@ -2535,15 +2610,36 @@ def find_best_bottle_match(search_term: str, active_df: pd.DataFrame):
         full_n = _normalize_text(full)
         if term and (term in full_n or full_n in term):
             s = max(s, 0.93)
-        scored.append((full, int(r["bottle_id"]), s))
+        stock = r.get("stock_status_per", None)
+        scored.append((full, int(r["bottle_id"]), s, stock))
 
     scored.sort(key=lambda x: x[2], reverse=True)
     top = scored[:5]
-    candidates = [{"full_name": a, "bottle_id": b, "score": round(c, 3)} for a, b, c in top]
+    candidates = [{"full_name": a, "bottle_id": b, "score": round(c, 3)} for a, b, c, _ in top]
     if not candidates:
-        return {"best_name": None, "bottle_id": None, "score": 0.0, "candidates": []}
-    return {"best_name": candidates[0]["full_name"], "bottle_id": candidates[0]["bottle_id"], "score": candidates[0]["score"], "candidates": candidates}
+        return {"best_name": None, "bottle_id": None, "score": 0.0, "candidates": [], "duplicates": []}
 
+    best = candidates[0]
+
+    # Detect duplicate bottle_ids sharing the same full_name at the top score
+    best_name_norm = _normalize_text(best["full_name"])
+    best_score = best["score"]
+    duplicates = [
+        {"full_name": a, "bottle_id": b, "stock_status_per": stk}
+        for a, b, c, stk in scored
+        if _normalize_text(a) == best_name_norm and round(c, 3) >= best_score - 0.01
+    ]
+    # Only flag as duplicates when there are truly multiple distinct bottle_ids
+    if len(duplicates) <= 1:
+        duplicates = []
+
+    return {
+        "best_name": best["full_name"],
+        "bottle_id": best["bottle_id"],
+        "score": best["score"],
+        "candidates": candidates,
+        "duplicates": duplicates,
+    }
 # ==========================================
 # Update execution
 # ==========================================
@@ -2559,7 +2655,7 @@ def execute_drink_update(
 ):
     if bottle_id not in inventory_dict:
         return False, "❌ לא מצאתי את ה-ID הזה במלאי."
-
+    print(bottle_id)
     b_data = inventory_dict[bottle_id]
     vol = b_data["vol"] or 700
     drank_per = (amount_ml / vol) * 100
@@ -2590,10 +2686,10 @@ def execute_drink_update(
     sql_palette = sql_array(f_palette)
 
     if drinkers:
-        safe_drinker = _escape_sql_str(", ".join([str(d).strip() for d in drinkers if str(d).strip()]))
-        sql_drinker = f"'{safe_drinker}'"
+            clean_drinkers = [str(d).strip() for d in drinkers if str(d).strip()]
+            sql_drinker = sql_array(clean_drinkers)
     else:
-        sql_drinker = "NULL"
+        sql_drinker = "[]"
 
     sql = f"""
     -- ===== DECLARES FIRST =====
@@ -3818,6 +3914,71 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "אם אני לא בטוח בשם – אציע התאמה ואבקש אישור לפני עדכון."
     )
 
+async def handle_final_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles upd_confirm:yes / upd_confirm:no InlineKeyboard callbacks
+    from the guided update flow summary screen.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    update_flow = _get_update_flow(context)
+    if not update_flow or update_flow.get("stage") != "await_final_confirm":
+        await query.edit_message_text("הפעולה פגה. כתוב 'עדכן בקבוק' מחדש.")
+        return
+
+    if data == "upd_confirm:yes":
+        df_all = get_all_data_as_df()
+        active_upd = df_all[df_all["stock_status_per"] > 0].copy()
+        inventory_dict = {
+            int(r["bottle_id"]): {
+                "name": r["full_name"],
+                "stock": float(r["stock_status_per"]),
+                "vol": float(r["orignal_volume"]) if pd.notnull(r.get("orignal_volume")) else 700.0,
+                "old_nose": normalize_to_list(r.get("nose")),
+                "old_palette": normalize_to_list(r.get("palette")),
+                "old_abv": float(r["alcohol_percentage"]) if pd.notnull(r.get("alcohol_percentage")) else 0.0,
+            }
+            for _, r in active_upd.iterrows()
+        }
+        ok, msg = execute_drink_update(
+            int(update_flow["bottle_id"]),
+            int(update_flow["amount_ml"]),
+            inventory_dict,
+            update_flow["glasses_cnt"],
+            drinkers=update_flow.get("drinkers"),
+        )
+        bottle_name = update_flow.get("full_name", "הבקבוק")
+        _set_focus_bottle(context, {"bottle_id": int(update_flow["bottle_id"]), "full_name": bottle_name})
+        _clear_update_flow(context)
+        if ok:
+            await query.edit_message_text(
+                f"{msg}\n\n"
+                f"🎉 הבקבוק *{bottle_name}* עודכן בהצלחה!",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ העדכון של *{bottle_name}* נכשל:\n{msg}",
+                parse_mode="Markdown"
+            )
+        return
+
+    if data == "upd_confirm:no":
+        update_flow["stage"] = "await_fix_field"
+        _set_update_flow(context, update_flow)
+        await query.edit_message_text(
+            f"סיכום:\n"
+            f"🥃 {update_flow['full_name']}\n"
+            f"👤 {', '.join(update_flow.get('drinkers', []))}\n"
+            f"📏 {update_flow['amount_ml']} מ\"ל\n"
+            f"🥛 {update_flow['glasses_cnt']} כוסות\n\n"
+            f"מה לתקן?\n1. בקבוק\n2. שותה\n3. כמות (מ\"ל)\n4. כוסות\n5. ביטול"
+        )
+        return
+
+
 async def handle_drinker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     query = update.callback_query
@@ -3902,13 +4063,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 payload = _apply_controlled_vocab(scan_raw, active_df)
 
-                # Store payload and move to price
+                # ── Duplicate check ──────────────────────────────────────
+                dup_found = False
+                if not active_df.empty and "distillery" in active_df.columns and "bottle_name" in active_df.columns:
+                    p_dist   = _normalize_text(payload.get("distillery") or "")
+                    p_bottle = _normalize_text(payload.get("bottle_name") or "")
+                    if p_dist and p_bottle:
+                        for _, row in active_df.iterrows():
+                            r_dist   = _normalize_text(str(row.get("distillery") or ""))
+                            r_bottle = _normalize_text(str(row.get("bottle_name") or ""))
+                            if r_dist == p_dist and r_bottle == p_bottle:
+                                dup_found = True
+                                break
+
+                # Store payload
                 _set_add_payload(context, payload)
-                _set_add_stage(context, "await_price")
 
                 await update.message.reply_text("✅ סריקה הושלמה. הנה מה שחילצתי:")
                 await update.message.reply_text(_format_add_summary(payload))
-                await update.message.reply_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+
+                if dup_found:
+                    _set_add_stage(context, "await_duplicate_confirm")
+                    await update.message.reply_text(
+                        f"⚠️ שים לב: הבקבוק *{payload.get('bottle_name')}* של *{payload.get('distillery')}* "
+                        f"כבר קיים במאגר שלך.\n"
+                        f"האם ברצונך להוסיף עותק נוסף? (כן/לא)"
+                    )
+                else:
+                    _set_add_stage(context, "await_price")
+                    await update.message.reply_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
                 return
             except Exception as e:
                 logging.exception(e)
@@ -3996,6 +4179,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Add Bottle flow (text stages)
     # ===========================
     stage = _get_add_stage(context)
+
+    if stage == "await_duplicate_confirm":
+        t = _normalize_text(user_text)
+        if any(_normalize_text(x) == t for x in _CONFIRM_YES) or t in ("כן", "yes"):
+            _set_add_stage(context, "await_price")
+            await update.message.reply_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+        elif any(_normalize_text(x) == t for x in _CONFIRM_NO) or t in ("לא", "no"):
+            _clear_add_flow(context)
+            await update.message.reply_text("סבבה, ביטלתי את ההוספה. שלח שאלה חדשה 🙂")
+        else:
+            await update.message.reply_text("ענה בבקשה כן/לא.")
+        return
 
     if stage == "await_price":
         m = re.search(r"(\d+(?:\.\d+)?)", user_text.replace(",", ""))
@@ -4305,11 +4500,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not match["best_name"] or match["score"] < 0.55:
                 await update.message.reply_text("לא מצאתי. נסה שוב (מזקקה + שם בקבוק).")
                 return
+
+            # ── Disambiguation: multiple bottle_ids with the same name ──
+            dups = match.get("duplicates", [])
+            if dups:
+                update_flow["duplicate_options"] = dups
+                update_flow["stage"] = "await_duplicate_select"
+                _set_update_flow(context, update_flow)
+                lines = [
+                    f"{i+1}. 🥃 {d['full_name']}  |  bottle_id: {d['bottle_id']}  |  נשאר: {round(float(d['stock_status_per'] or 0))}%"
+                    for i, d in enumerate(dups)
+                ]
+                await update.message.reply_text(
+                    f"מצאתי {len(dups)} בקבוקים עם אותו שם. איזה מהם לעדכן?\n\n"
+                    + "\n".join(lines)
+                    + "\n\nשלח את המספר המתאים:"
+                )
+                return
+
             update_flow["bottle_id"] = match["bottle_id"]
             update_flow["full_name"] = match["best_name"]
             update_flow["stage"] = "await_bottle_confirm"
             _set_update_flow(context, update_flow)
             await update.message.reply_text(f"התכוונת ל: 🥃 {match['best_name']}? (כן / לא)")
+            return
+
+        if stage == "await_duplicate_select":
+            dups = update_flow.get("duplicate_options", [])
+            try:
+                choice = int(user_text.strip()) - 1
+                if choice < 0 or choice >= len(dups):
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(f"שלח מספר בין 1 ל-{len(dups)}.")
+                return
+            chosen = dups[choice]
+            update_flow["bottle_id"] = chosen["bottle_id"]
+            update_flow["full_name"] = chosen["full_name"]
+            update_flow.pop("duplicate_options", None)
+            update_flow["stage"] = "await_drinker"
+            update_flow["known_drinkers"] = _get_known_drinkers_from_df()
+            update_flow["selected_drinkers"] = []
+            _set_update_flow(context, update_flow)
+            known = update_flow["known_drinkers"]
+            if known:
+                kb = _build_drinker_keyboard(known, [])
+                await update.message.reply_text(
+                    f"✅ נבחר: 🥃 {chosen['full_name']} (ID: {chosen['bottle_id']})\nמי שתה?",
+                    reply_markup=kb
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ נבחר: 🥃 {chosen['full_name']} (ID: {chosen['bottle_id']})\nמי שתה? (כתוב שם)"
+                )
             return
 
         if stage == "await_bottle_confirm":
@@ -4386,13 +4629,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_flow["glasses_cnt"] = int(m_g.group(1))
             update_flow["stage"] = "await_final_confirm"
             _set_update_flow(context, update_flow)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ כן", callback_data="upd_confirm:yes"),
+                InlineKeyboardButton("❌ לא", callback_data="upd_confirm:no"),
+            ]])
             await update.message.reply_text(
                 f"סיכום:\n"
                 f"🥃 {update_flow['full_name']}\n"
                 f"👤 {', '.join(update_flow.get('drinkers', []))}\n"
                 f"📏 {update_flow['amount_ml']} מ\"ל\n"
                 f"🥛 {update_flow['glasses_cnt']} כוסות\n\n"
-                f"לעדכן? (כן / לא)"
+                f"לעדכן?",
+                reply_markup=kb
             )
             return
 
@@ -5263,6 +5511,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_final_confirm_callback, pattern=r"^upd_confirm:"))
     application.add_handler(CallbackQueryHandler(handle_drinker_callback, pattern=r"^drk_"))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
