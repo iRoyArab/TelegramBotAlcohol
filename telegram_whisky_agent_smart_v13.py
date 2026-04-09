@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v56"
+BOT_VERSION = "v57"
 import time
 import re
 import json
@@ -497,6 +497,46 @@ _GROUP_ABV_MAX_RE = re.compile(
     r"(הכי\s*אלכוהולי|הכי\s*(?:חזק|גבוה).*abv|abv.*הכי\s*(?:גבוה|חזק)|highest\s*abv|most\s*alcohol|אחוז\s*אלכוהול\s*הכי\s*גבוה)",
     re.IGNORECASE
 )
+
+# Matches: "מתחת ל-30% נשאר", "פחות מ-50% נשאר", "below 40% remaining", "under 25% left"
+_STOCK_THRESHOLD_RE = re.compile(
+    r"(?:מתחת\s*ל[–\-]?|פחות\s*מ[–\-]?|under\s*|below\s*)(\d{1,3})\s*%"
+    r"(?:.*(?:נשאר|נשארו|left|remaining))?",
+    re.IGNORECASE
+)
+
+
+def try_handle_stock_threshold(user_text: str, active_df: "pd.DataFrame") -> str | None:
+    """Handle queries like 'איזה בקבוקים מתחת ל-30% נשאר?'"""
+    m = _STOCK_THRESHOLD_RE.search(user_text)
+    if not m:
+        return None
+    # Must be about remaining stock (not ABV)
+    t = user_text.lower()
+    if any(w in t for w in ("abv", "alcohol", "אלכוהול", "חזק")):
+        return None
+    threshold = float(m.group(1))
+    if active_df is None or active_df.empty:
+        return "אין לי בקבוקים פעילים במאגר כרגע."
+    df_w = active_df.copy()
+    if "stock_status_per" not in df_w.columns:
+        return "אין לי נתוני מלאי כרגע."
+    df_w["_per"] = pd.to_numeric(df_w["stock_status_per"], errors="coerce")
+    filtered = df_w[df_w["_per"] < threshold].dropna(subset=["_per"])
+    filtered = filtered.sort_values("_per")
+    if filtered.empty:
+        return f"✅ אין בקבוקים עם פחות מ-{int(threshold)}% נשאר — כולם במצב טוב!"
+    sep = "━━━━━━━━━━━━━━━━━━"
+    lines = []
+    for _, row in filtered.iterrows():
+        name = str(row.get("full_name") or row.get("bottle_name") or "-")
+        per = row["_per"]
+        urgency = "🔴 כמעט נגמר!" if per <= 10 else "🟠 מעט נשאר" if per <= 25 else "🟡 מתחת לסף"
+        lines.append(f"🥃 {name}\n    📊 נשאר: {round(per, 1)}%  {urgency}")
+    return (
+        f"{sep}\n📉 בקבוקים עם פחות מ-{int(threshold)}% נשאר ({len(filtered)} בקבוקים)\n{sep}\n\n"
+        + "\n\n".join(lines)
+    )
 
 
 def _detect_group_extreme_intent(user_text: str) -> str | None:
@@ -2089,7 +2129,7 @@ def _get_add_payload(context) -> dict:
     return context.chat_data.get("add_payload", {})
 
 def _clear_add_flow(context):
-    for k in ("add_stage", "add_payload"):
+    for k in ("add_stage", "add_payload", "se_ctx", "se_edit_origin"):
         context.chat_data.pop(k, None)
 
 def _sql_str_or_null(v):
@@ -2331,6 +2371,16 @@ Your task is to analyze a whisky bottle label image and extract technical data i
 2. Identify distillery and origin. Recognize logos (e.g. 'M&H' -> 'Milk & Honey', Israel).
 3. Analyze cask type.
 4. Infer sensory profile: if missing, generate accurate keywords based on cask + distillery + climate.
+5. For the "region" field: use the whisky-producing region or sub-region based on where the distillery is located.
+   - Scotland: use the Scotch region (e.g. "Speyside", "Islay", "Highlands", "Lowlands", "Campbeltown")
+   - Ireland: use province or county (e.g. "County Cork", "Dublin")
+   - USA: use state or bourbon region (e.g. "Kentucky", "Tennessee")
+   - Japan: use prefecture or distillery area (e.g. "Hokkaido", "Yamanashi", "Yoichi")
+   - Israel: use the city the distillery is in (e.g. Milk & Honey -> "Tel Aviv", Pelter -> "Golan Heights")
+   - Taiwan: use region (e.g. Kavalan -> "Yilan")
+   - India: use state (e.g. "Goa", "Karnataka")
+   - Other countries: use the city or area the distillery is physically located in.
+   Never return null for region if you can infer it from the distillery identity.
 
 ### PHASE 2: STRICT OPERATIONAL PROTOCOLS
 - Exact match only. Do not conflate versions.
@@ -2361,6 +2411,10 @@ Inference rules:
 
 ### PHASE 4: OUTPUT SCHEMA
 Return a single JSON object only.
+Rules for bottle_name:
+- Use ONLY the expression/product name as it appears on the label, WITHOUT the distillery name prefix.
+- Examples: "Tomatin 12 Year Old" -> "12 Year Old" | "Glenfiddich 18" -> "18 Year Old" | "Milk & Honey Under the Milky Way" -> "Under the Milky Way" | "Deanston Virgin Oak" -> "Virgin Oak"
+- If the label only shows an age number (e.g. "12"), use "12 Year Old".
 {
   "bottle_name": string,
   "distillery": string,
@@ -2397,6 +2451,113 @@ Return a single JSON object only.
         clean_text = clean_text[3:-3]
     return json.loads(clean_text)
 
+
+def _gemini_enrich_bottle_info(distillery: str, bottle_name: str, missing_fields: list[str]) -> dict:
+    """
+    Fallback: ask Gemini to fill in missing fields for a known distillery + bottle name.
+    Only returns values for the requested missing_fields.
+    """
+    fields_desc = ", ".join(missing_fields)
+    prompt = f"""You are an expert whisky database. I have identified the bottle as:
+Distillery: {distillery}
+Bottle: {bottle_name}
+
+The following fields could NOT be read from the label and need to be filled in from your knowledge:
+{fields_desc}
+
+Return a single JSON object with ONLY the fields listed above.
+Use null for any field you genuinely don't know.
+Field descriptions:
+- age: integer, years aged (e.g. 12)
+- alcohol_percentage: float, ABV (e.g. 46.3)
+- alcohol_type: string, type of spirit (e.g. "Single Malt Whisky", "Blended Scotch Whisky", "Bourbon", "Irish Whiskey")
+- region: string, the whisky region or city where the distillery is physically located.
+  Scotland -> Scotch region (e.g. "Speyside", "Islay", "Highlands", "Lowlands", "Campbeltown").
+  Israel -> city (e.g. Milk & Honey -> "Tel Aviv", Pelter -> "Golan Heights").
+  Japan -> prefecture (e.g. Nikka Yoichi -> "Hokkaido", Suntory -> "Yamanashi").
+  USA -> state (e.g. "Kentucky", "Tennessee").
+  Taiwan -> area (e.g. Kavalan -> "Yilan").
+  Other countries -> city or area. NEVER return null if you know the distillery location.
+- origin_country: string (e.g. "Scotland", "Ireland", "Israel", "Japan")
+- casks: list of strings describing cask types (e.g. ["American Oak", "Sherry Oak"])
+- nose: list of aroma descriptor strings (e.g. ["Vanilla", "Honey", "Citrus"])
+- palate: list of flavour descriptor strings (e.g. ["Dried fruit", "Caramel", "Pepper"])
+- orignal_volume: integer, standard bottle volume in ml (e.g. 700)
+- rarity: one of ["Core Range","Limited Edition","Small Batch","Local Distillery Core Range","Private Release Blend","Single Cask","Private Release Single Cask","Distillery Edition Single Cask"]
+
+Return ONLY the JSON object, no explanation.
+"""
+    resp = ai_client.models.generate_content(
+        model='gemini-2.0-flash',
+        contents=[prompt],
+        config={
+            "response_mime_type": "application/json",
+            "temperature": 0.1
+        }
+    )
+    clean_text = (resp.text or "").strip()
+    if clean_text.startswith('```json'):
+        clean_text = clean_text[7:-3]
+    elif clean_text.startswith('```'):
+        clean_text = clean_text[3:-3]
+    try:
+        return json.loads(clean_text)
+    except Exception:
+        return {}
+
+
+def _enrich_scan_if_needed(scan: dict) -> dict:
+    """
+    After label scan, check for missing key fields.
+    If distillery + bottle_name are known, call Gemini to fill in any gaps.
+    Returns the (possibly enriched) scan dict.
+    """
+    distillery = scan.get("distillery")
+    bottle_name = scan.get("bottle_name")
+
+    # Can't enrich without identity
+    if not distillery or not bottle_name:
+        return scan
+
+    missing = []
+    if not scan.get("age"):
+        missing.append("age")
+    if not scan.get("alcohol_percentage"):
+        missing.append("alcohol_percentage")
+    if not scan.get("alcohol_type"):
+        missing.append("alcohol_type")
+    if not scan.get("region"):
+        missing.append("region")
+    if not scan.get("origin_country"):
+        missing.append("origin_country")
+    if not scan.get("casks"):
+        missing.append("casks")
+    if not scan.get("nose"):
+        missing.append("nose")
+    if not scan.get("palate"):
+        missing.append("palate")
+    if not scan.get("orignal_volume"):
+        missing.append("orignal_volume")
+    if not scan.get("rarity"):
+        missing.append("rarity")
+
+    if not missing:
+        return scan
+
+    logging.info(f"[ENRICH] Missing fields {missing} for '{bottle_name}' by '{distillery}' — querying Gemini knowledge base.")
+    enriched = _gemini_enrich_bottle_info(distillery, bottle_name, missing)
+
+    # Only fill in fields that were missing (don't overwrite what was read from the label)
+    result = dict(scan)
+    for field in missing:
+        val = enriched.get(field)
+        if val is not None and val != [] and val != "":
+            result[field] = val
+            logging.info(f"[ENRICH] Filled '{field}' = {val}")
+
+    return result
+
+
 RARITY_OPTIONS = [
     "Core Range",
     "Limited Edition",
@@ -2407,6 +2568,116 @@ RARITY_OPTIONS = [
     "Private Release Single Cask",
     "Distillery Edition Single Cask",
 ]
+
+# ─── Scan-edit field definitions ───────────────────────────────────────────────
+# (payload_key, display_label, field_type, df_col_for_options)
+# field_type: "text" | "numeric" | "single" | "multi" | "bool"
+SCAN_EDIT_FIELDS = [
+    ("bottle_name",        "Bottle Name",      "text",    None),
+    ("distillery",         "Distillery",       "text",    None),
+    ("age",                "Age",              "numeric", None),
+    ("alcohol_percentage", "ABV",              "numeric", None),
+    ("alcohol_type",       "Alcohol Type",     "single",  "alcohol_type"),
+    ("origin_country",     "Country",          "single",  "origin_country"),
+    ("region",             "Region",           "single",  "region"),
+    ("casks_aged_in",      "Casks",            "multi",   "casks_aged_in"),
+    ("nose",               "Nose",             "multi",   "nose"),
+    ("palette",            "Palate",           "multi",   "palette"),
+    ("orignal_volume",     "Volume (ml)",      "numeric", None),
+    ("rarity",             "Rarity",           "single",  None),
+    ("special_bottling",   "Special Bottling", "bool",    None),
+    ("limited_edition",    "Limited Edition",  "bool",    None),
+]
+
+_SE_FIELD_META = {k: (label, ftype, col) for k, label, ftype, col in SCAN_EDIT_FIELDS}
+
+
+def _build_field_picker_kb() -> InlineKeyboardMarkup:
+    """Keyboard with all editable fields, 2 per row, + Done button."""
+    buttons = []
+    row = []
+    for key, label, _, _ in SCAN_EDIT_FIELDS:
+        row.append(InlineKeyboardButton(label, callback_data=f"se_f:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✅ סיימתי לערוך", callback_data="se_proceed")])
+    return InlineKeyboardMarkup(buttons)
+
+
+_SE_PAGE_SIZE = 20  # options per page
+
+
+def _build_value_picker_kb(options: list[str], selected: list, is_list: bool, page: int = 0) -> InlineKeyboardMarkup:
+    """Value picker keyboard with pagination. Toggles checkmarks for multi-select fields."""
+    total = len(options)
+    start = page * _SE_PAGE_SIZE
+    end   = min(start + _SE_PAGE_SIZE, total)
+    page_opts = options[start:end]
+
+    buttons = []
+    for local_i, opt in enumerate(page_opts):
+        real_idx = start + local_i
+        prefix = "✅ " if opt in selected else ""
+        buttons.append([InlineKeyboardButton(f"{prefix}{opt}", callback_data=f"se_v:{real_idx}")])
+
+    # pagination row
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ הקודם", callback_data=f"se_pg:{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("▶️ הבא", callback_data=f"se_pg:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    bottom = [InlineKeyboardButton("✏️ ערך חדש", callback_data="se_custom")]
+    if is_list:
+        bottom.append(InlineKeyboardButton("✅ אישור", callback_data="se_done"))
+    buttons.append(bottom)
+    buttons.append([InlineKeyboardButton("↩️ חזרה לשדות", callback_data="se_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _se_value_picker_text(label: str, selected: list, is_list: bool, page: int, total: int) -> str:
+    """Message text shown above the value picker keyboard."""
+    sel_str = ", ".join(selected) if selected else "—"
+    hint = " (בחר כמה, לחץ אישור בסיום)" if is_list else ""
+    total_pages = max(1, -(-total // _SE_PAGE_SIZE))  # ceiling div
+    page_str = f" [עמוד {page + 1}/{total_pages}]" if total_pages > 1 else ""
+    return f"✏️ עריכת {label}{hint}{page_str}\nנבחר: {sel_str}"
+
+
+def _se_get_options(field_key: str, ftype: str, df_col) -> list[str]:
+    """Return selectable options for a given field."""
+    if ftype == "bool":
+        return ["כן", "לא"]
+    if field_key == "rarity":
+        return RARITY_OPTIONS
+    if df_col is None:
+        return []
+    active_df = get_all_data_as_df()
+    if active_df is None:
+        active_df = pd.DataFrame()
+    if ftype == "multi":
+        return _unique_from_array_col(active_df, df_col)
+    return _unique_from_scalar_col(active_df, df_col)
+
+
+def _se_field_picker_text(p: dict) -> str:
+    """Summary + prompt shown above the field picker keyboard."""
+    return _format_add_summary(p) + "\n\n✏️ איזה שדה לערוך?"
+
+
+def _se_apply_numeric(p: dict, field_key: str, raw: str) -> bool:
+    """Parse and apply a numeric value. Returns True on success."""
+    try:
+        p[field_key] = float(raw) if "." in raw else int(raw)
+        return True
+    except ValueError:
+        return False
+
 
 def _apply_controlled_vocab(scan: dict, active_df: pd.DataFrame) -> dict:
     """Map extracted strings to your existing vocab using Levenshtein."""
@@ -2490,7 +2761,12 @@ def insert_new_bottle_from_payload(p: dict) -> int:
     price_full = p.get("price_full")
     price_paid = p.get("price_paid")
     was_discounted = bool(p.get("was_discounted"))
-    discount_amount = p.get("discount_amount")
+    # BQ column discount_amount is FLOAT64 — strip any "%" or "₪" suffix and keep the number only
+    _da_raw = p.get("discount_amount")
+    try:
+        discount_amount = float(re.sub(r"[^\d.]", "", str(_da_raw))) if _da_raw is not None else None
+    except (ValueError, TypeError):
+        discount_amount = None
 
     special = bool(p.get("special_bottling"))
     limited = bool(p.get("limited_edition"))
@@ -2691,76 +2967,81 @@ def execute_drink_update(
     else:
         sql_drinker = "[]"
 
-    sql = f"""
-    -- ===== DECLARES FIRST =====
-    DECLARE upd_ts TIMESTAMP;
-    DECLARE upd_date DATE;
-    DECLARE consumption_match BOOL;
-    DECLARE forecasted_bid INT64;
-    DECLARE depletion_match BOOL;
-    DECLARE consumption_flag_str STRING;
-    DECLARE depletion_flag_str STRING;
+    from datetime import date as _date, datetime as _datetime
 
-    -- ===== SET =====
-    SET upd_ts   = CURRENT_TIMESTAMP();
-    SET upd_date = DATE(upd_ts);
+    today      = _date.today()
+    upd_ts_str = _datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
 
-    SET consumption_match = EXISTS (
-        SELECT 1 FROM `{FORECAST_TABLE_REF}`
-        WHERE DATE(est_consumption_date) = upd_date
-        LIMIT 1
-    );
-    SET forecasted_bid = (
-        SELECT bottle_id FROM `{FORECAST_TABLE_REF}`
-        WHERE DATE(est_consumption_date) = upd_date
-        LIMIT 1
-    );
+    # ── Step 1: Pre-fetch forecast data in Python ──
+    forecast_rows = list(bq_client.query(f"""
+        SELECT bottle_id,
+               DATE(est_consumption_date)  AS ec,
+               DATE(predicted_finish_date) AS pf
+        FROM `{FORECAST_TABLE_REF}`
+        WHERE DATE(est_consumption_date)  = '{today}'
+           OR DATE(predicted_finish_date) = '{today}'
+    """).result())
 
-    SET depletion_match = FALSE;
-    IF {new_stock_per} = 0 THEN
-        SET depletion_match = EXISTS (
-            SELECT 1 FROM `{FORECAST_TABLE_REF}`
-            WHERE DATE(predicted_finish_date) = upd_date
-            LIMIT 1
-        );
-    END IF;
+    consumption_match = any(r.ec == today for r in forecast_rows)
+    forecasted_bid    = next((r.bottle_id for r in forecast_rows if r.ec == today), None)
+    depletion_match   = (new_stock_per == 0.0) and any(r.pf == today for r in forecast_rows)
 
-    SET consumption_flag_str = IF(consumption_match, 'True', 'False');
-    SET depletion_flag_str   = IF(depletion_match,  'True', 'False');
+    consumption_flag_str = 'True' if consumption_match else 'False'
+    depletion_flag_str   = 'True' if depletion_match   else 'False'
+    forecasted_bid_sql   = str(forecasted_bid) if forecasted_bid is not None else 'NULL'
 
-    -- ===== UPDATE MAIN TABLE =====
-    UPDATE `{TABLE_REF}`
-    SET stock_status_per  = {new_stock_per},
-        full_or_empy      = {is_empty},
-        updating_time     = upd_ts
-    WHERE bottle_id = {bottle_id};
+    # ── Step 2: Pre-fetch next update_id in Python ──
+    id_rows = list(bq_client.query(
+        f"SELECT COALESCE(MAX(update_id), 0) + 1 AS next_id FROM `{HISTORY_TABLE_REF}`"
+    ).result())
+    next_id = int(id_rows[0].next_id) if id_rows else 1
 
-    -- ===== INSERT HISTORY =====
-    INSERT INTO `{HISTORY_TABLE_REF}`
-    (
-        update_id, bottle_id, bottle_name, stock_status_per,
-        update_time, drams_counter, nose, palette, alc_pre,
-        consumption_flag, depletion_flag, forecasted_bottle_id, drinker_name
-    )
-    VALUES (
-        (SELECT COALESCE(MAX(update_id), 0) + 1 FROM `{HISTORY_TABLE_REF}`),
-        {bottle_id},
-        '{safe_name}',
-        {new_stock_per},
-        upd_ts,
-        {glasses_cnt},
-        {sql_nose},
-        {sql_palette},
-        {f_abv},
-        consumption_flag_str,
-        depletion_flag_str,
-        IF(consumption_match, forecasted_bid, NULL),
-        {sql_drinker}
-    );
-    """
+    # ── Step 3: UPDATE main table ──
+    if b_data["stock"] == 100:
+        # Opening event: also stamp nose, palette, abv, opening_date
+        bq_client.query(f"""
+            UPDATE `{TABLE_REF}`
+            SET stock_status_per   = {new_stock_per},
+                full_or_empy       = {is_empty},
+                updating_time      = TIMESTAMP('{upd_ts_str}'),
+                nose               = {sql_nose},
+                palette            = {sql_palette},
+                alcohol_percentage = {f_abv},
+                opening_date       = DATE('{today}')
+            WHERE bottle_id = {bottle_id}
+        """).result()
+    else:
+        bq_client.query(f"""
+            UPDATE `{TABLE_REF}`
+            SET stock_status_per   = {new_stock_per},
+                full_or_empy       = {is_empty},
+                updating_time      = TIMESTAMP('{upd_ts_str}'),
+                alcohol_percentage = {f_abv}
+            WHERE bottle_id = {bottle_id}
+        """).result()
 
-    job_config = bigquery.QueryJobConfig(use_legacy_sql=False)
-    bq_client.query(sql, job_config=job_config).result()
+    # ── Step 4: INSERT history row ──
+    bq_client.query(f"""
+        INSERT INTO `{HISTORY_TABLE_REF}`
+        (update_id, bottle_id, bottle_name, stock_status_per,
+         update_time, drams_counter, nose, palette, alc_pre,
+         consumption_flag, depletion_flag, forecasted_bottle_id, drinker_name)
+        VALUES (
+            {next_id},
+            {bottle_id},
+            '{safe_name}',
+            {new_stock_per},
+            TIMESTAMP('{upd_ts_str}'),
+            {glasses_cnt},
+            {sql_nose},
+            {sql_palette},
+            {f_abv},
+            '{consumption_flag_str}',
+            '{depletion_flag_str}',
+            {forecasted_bid_sql},
+            {sql_drinker}
+        )
+    """).result()
 
     # invalidate cache
     global CACHE_DATA
@@ -2781,6 +3062,8 @@ def execute_drink_update(
         lines.append(f"👃 Nose עודכן: {', '.join(f_nose)}")
     if new_abv is not None:
         lines.append(f"🔢 ABV עודכן: {f_abv}%")
+    if 0 < new_stock_per <= 20:
+        lines.append(f"\n⚠️ נותרו רק {new_stock_per}% — הבקבוק מתקרב לסיום!")
 
     return True, "\n".join(lines)
 
@@ -3914,6 +4197,429 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "אם אני לא בטוח בשם – אציע התאמה ואבקש אישור לפני עדכון."
     )
 
+# ==========================================
+# /help command
+# ==========================================
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🥃 *Whisky Bot* — מדריך מהיר\n\n"
+        "*🔍 שאלות על המלאי:*\n"
+        "• כמה בקבוקי גלנפידיך יש לי?\n"
+        "• איזה בקבוקים מתחת ל-30% נשאר?\n"
+        "• מה ה-ABV של M\\&H Biblical?\n"
+        "• איזה בקבוק הכי מתוק/מעושן שלי?\n\n"
+        "*📊 אנליטיקה:*\n"
+        "• איזה בקבוק הכי פופולרי שלי?\n"
+        "• מה עדיף לפתוח עכשיו? (VFM)\n"
+        "• איזה בקבוקים עתידים להיגמר בקרוב?\n\n"
+        "*🥃 עדכון שתייה:*\n"
+        "• שתיתי 60ml Glenfiddich 15\n"
+        "• עדכן בקבוק — תפריט מודרך עם כפתורים\n\n"
+        "*➕ הוספת בקבוק חדש:*\n"
+        "• הוסף בקבוק — ואז שלח תמונה של התווית\n\n"
+        "*📋 פקודות:*\n"
+        "/list — רשימת כל הבקבוקים הפעילים\n"
+        "/start — הפעלה מחדש\n"
+        "/help — המדריך הזה"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ==========================================
+# /list — paginated active bottle browser
+# ==========================================
+_LIST_PAGE_SIZE = 8
+
+async def _send_list_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    df = get_all_data_as_df()
+    if df is None or df.empty:
+        text = "אין בקבוקים במאגר."
+        if update.message:
+            await update.message.reply_text(text)
+        else:
+            await update.callback_query.edit_message_text(text)
+        return
+    active = df[df["stock_status_per"] > 0].copy()
+    if "full_name" in active.columns:
+        active = active.sort_values("full_name")
+    total = len(active)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = active.iloc[page * _LIST_PAGE_SIZE:(page + 1) * _LIST_PAGE_SIZE]
+
+    lines = [f"📋 מלאי פעיל (עמוד {page+1}/{total_pages} | {total} בקבוקים):\n"]
+    for _, row in chunk.iterrows():
+        name = row.get("full_name") or row.get("bottle_name") or "?"
+        stock = round(float(row.get("stock_status_per") or 0))
+        warn = " ⚠️" if stock <= 20 else ""
+        lines.append(f"🥃 {name} — {stock}%{warn}")
+    text = "\n".join(lines)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ הקודם", callback_data=f"list_page:{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("הבא ▶️", callback_data=f"list_page:{page+1}"))
+    kb = InlineKeyboardMarkup([nav]) if nav else None
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_list_page(update, context, page=0)
+
+async def handle_list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    await _send_list_page(update, context, page=page)
+
+
+# ==========================================
+# Add-bottle flow inline button callbacks
+# ==========================================
+async def handle_add_flow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles scan_edit, scan_cont, add_dup:*, add_disc:*, add_gift:*, add_conf:* callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    def _gift_kb():
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן", callback_data="add_gift:yes"),
+            InlineKeyboardButton("❌ לא", callback_data="add_gift:no"),
+        ]])
+
+    def _conf_kb():
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן, הוסף", callback_data="add_conf:yes"),
+            InlineKeyboardButton("✏️ ערוך", callback_data="add_conf:edit"),
+            InlineKeyboardButton("❌ ביטול", callback_data="add_conf:no"),
+        ]])
+
+    # ── scan_edit: launch field-picker UI ──
+    if data == "scan_edit":
+        context.chat_data["se_edit_origin"] = "pre_price"
+        _set_add_stage(context, "await_se_field")
+        p = _get_add_payload(context)
+        await query.edit_message_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
+        return
+
+    # ── scan_cont: continue (no duplicate) ──
+    if data == "scan_cont":
+        _set_add_stage(context, "await_price")
+        await query.edit_message_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+        return
+
+    # ── add_dup:yes/no ──
+    if data == "add_dup:yes":
+        _set_add_stage(context, "await_price")
+        await query.edit_message_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+        return
+    if data == "add_dup:no":
+        _clear_add_flow(context)
+        await query.edit_message_text("סבבה, ביטלתי את ההוספה.")
+        return
+
+    # ── add_disc:yes/no ──
+    if data == "add_disc:yes":
+        _set_add_stage(context, "await_discount_amount")
+        await query.edit_message_text("כתוב את גובה ההנחה: למשל 10% או 50₪")
+        return
+    if data == "add_disc:no":
+        p = _get_add_payload(context)
+        p["was_discounted"] = False
+        p["discount_amount"] = None
+        p["price_full"] = p.get("price_paid")
+        _set_add_payload(context, p)
+        _set_add_stage(context, "await_gift_q")
+        await query.edit_message_text("האם מדובר במתנה?", reply_markup=_gift_kb())
+        return
+
+    # ── add_gift:yes/no ──
+    if data in ("add_gift:yes", "add_gift:no"):
+        p = _get_add_payload(context)
+        p["was_a_gift"] = (data == "add_gift:yes")
+        _set_add_payload(context, p)
+        _set_add_stage(context, "await_confirm_insert")
+        await query.edit_message_text("מעולה!")
+        await context.bot.send_message(query.message.chat_id, _format_add_summary(p))
+        await context.bot.send_message(
+            query.message.chat_id,
+            "לאשר הכנסת הבקבוק?",
+            reply_markup=_conf_kb()
+        )
+        return
+
+    # ── add_conf:yes/no/edit ──
+    if data == "add_conf:yes":
+        try:
+            p = _get_add_payload(context)
+            new_id = insert_new_bottle_from_payload(p)
+            _clear_add_flow(context)
+            await query.edit_message_text(f"✅ הבקבוק נוסף! bottle_id={new_id}")
+        except Exception as e:
+            logging.exception(e)
+            await query.edit_message_text(f"❌ הכנסת הבקבוק נכשלה: {e}")
+        return
+    if data == "add_conf:no":
+        _clear_add_flow(context)
+        await query.edit_message_text("ביטלתי.")
+        return
+    if data == "add_conf:edit":
+        context.chat_data["se_edit_origin"] = "confirm"
+        _set_add_stage(context, "await_se_field")
+        p = _get_add_payload(context)
+        await query.edit_message_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
+        return
+
+
+# ==========================================
+# Scan-edit field/value picker callbacks  (se_* pattern)
+# ==========================================
+async def handle_scan_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all se_* callbacks for the scan-edit inline UI."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    p = _get_add_payload(context)
+
+    # ── back to field picker ──────────────────────────────────────
+    if data in ("se_back", "se_start"):
+        _set_add_stage(context, "await_se_field")
+        context.chat_data.pop("se_ctx", None)
+        await query.edit_message_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
+        return
+
+    # ── field selected ────────────────────────────────────────────
+    if data.startswith("se_f:"):
+        field_key = data[5:]
+        if field_key not in _SE_FIELD_META:
+            return
+        label, ftype, df_col = _SE_FIELD_META[field_key]
+        options = _se_get_options(field_key, ftype, df_col)
+
+        cur = p.get(field_key)
+        selected = list(cur) if isinstance(cur, list) else ([str(cur)] if cur is not None else [])
+
+        context.chat_data["se_ctx"] = {
+            "field_key": field_key,
+            "field_label": label,
+            "field_type": ftype,
+            "options": options,
+            "selected": selected,
+            "page": 0,
+        }
+
+        if ftype in ("text", "numeric"):
+            _set_add_stage(context, "await_se_custom")
+            cur_display = selected[0] if selected else "—"
+            await query.edit_message_text(
+                f"✏️ עריכת {label}\nנוכחי: {cur_display}\n\nשלח את הערך החדש:"
+            )
+            return
+
+        _set_add_stage(context, "await_se_value")
+        is_list = (ftype == "multi")
+        await query.edit_message_text(
+            _se_value_picker_text(label, selected, is_list, 0, len(options)),
+            reply_markup=_build_value_picker_kb(options, selected, is_list, 0)
+        )
+        return
+
+    # ── page navigation ───────────────────────────────────────────
+    if data.startswith("se_pg:"):
+        se_ctx = context.chat_data.get("se_ctx", {})
+        try:
+            page = int(data[6:])
+        except ValueError:
+            return
+        se_ctx["page"] = page
+        context.chat_data["se_ctx"] = se_ctx
+        options  = se_ctx.get("options", [])
+        selected = se_ctx.get("selected", [])
+        label    = se_ctx.get("field_label", "")
+        is_list  = (se_ctx.get("field_type") == "multi")
+        await query.edit_message_text(
+            _se_value_picker_text(label, selected, is_list, page, len(options)),
+            reply_markup=_build_value_picker_kb(options, selected, is_list, page)
+        )
+        return
+
+    # ── value toggled/selected ────────────────────────────────────
+    if data.startswith("se_v:"):
+        se_ctx = context.chat_data.get("se_ctx", {})
+        try:
+            idx = int(data[5:])
+        except ValueError:
+            return
+        options  = se_ctx.get("options", [])
+        selected = list(se_ctx.get("selected", []))
+        ftype     = se_ctx.get("field_type", "single")
+        field_key = se_ctx.get("field_key", "")
+        label     = se_ctx.get("field_label", "")
+        page      = se_ctx.get("page", 0)
+
+        if idx < 0 or idx >= len(options):
+            return
+        val = options[idx]
+
+        if ftype == "bool":
+            p[field_key] = (val == "כן")
+            _set_add_payload(context, p)
+            context.chat_data.pop("se_ctx", None)
+            _set_add_stage(context, "await_se_field")
+            await query.edit_message_text(
+                _se_field_picker_text(p),
+                reply_markup=_build_field_picker_kb()
+            )
+            return
+
+        if ftype == "multi":
+            if val in selected:
+                selected.remove(val)
+            else:
+                selected.append(val)
+            se_ctx["selected"] = selected
+            context.chat_data["se_ctx"] = se_ctx
+            # edit_message_text keeps text + keyboard in sync and avoids
+            # the Telegram "message not modified" error from edit_message_reply_markup
+            await query.edit_message_text(
+                _se_value_picker_text(label, selected, True, page, len(options)),
+                reply_markup=_build_value_picker_kb(options, selected, True, page)
+            )
+            return
+
+        # single select — apply immediately and return to field picker
+        p[field_key] = val
+        _set_add_payload(context, p)
+        context.chat_data.pop("se_ctx", None)
+        _set_add_stage(context, "await_se_field")
+        await query.edit_message_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
+        return
+
+    # ── custom value (redirect to text stage) ────────────────────
+    if data == "se_custom":
+        se_ctx = context.chat_data.get("se_ctx", {})
+        label  = se_ctx.get("field_label", "")
+        ftype  = se_ctx.get("field_type", "single")
+        hint   = " (מופרד בפסיקים)" if ftype == "multi" else ""
+        _set_add_stage(context, "await_se_custom")
+        await query.edit_message_text(
+            f"✏️ הכנס ערך חדש עבור {label}{hint}:"
+        )
+        return
+
+    # ── confirm multi-select ──────────────────────────────────────
+    if data == "se_done":
+        se_ctx    = context.chat_data.get("se_ctx", {})
+        field_key = se_ctx.get("field_key", "")
+        selected  = list(se_ctx.get("selected", []))
+        p[field_key] = selected
+        _set_add_payload(context, p)
+        context.chat_data.pop("se_ctx", None)
+        _set_add_stage(context, "await_se_field")
+        await query.edit_message_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
+        return
+
+    # ── proceed (done editing) ────────────────────────────────────
+    if data == "se_proceed":
+        context.chat_data.pop("se_ctx", None)
+        edit_origin = context.chat_data.pop("se_edit_origin", "pre_price")
+        if edit_origin == "confirm":
+            _set_add_stage(context, "await_confirm_insert")
+            conf_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ כן, הוסף", callback_data="add_conf:yes"),
+                InlineKeyboardButton("✏️ ערוך", callback_data="add_conf:edit"),
+                InlineKeyboardButton("❌ ביטול", callback_data="add_conf:no"),
+            ]])
+            await query.edit_message_text(_format_add_summary(p))
+            await context.bot.send_message(
+                query.message.chat_id, "לאשר הכנסת הבקבוק?", reply_markup=conf_kb
+            )
+        else:
+            _set_add_stage(context, "await_price")
+            await query.edit_message_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+        return
+
+
+# ==========================================
+# Update-flow bottle-confirm + fix-field inline callbacks
+# ==========================================
+async def handle_update_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles upd_bot:yes/no (bottle confirm) and upd_fix:N (fix field) callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    update_flow = _get_update_flow(context)
+
+    if data == "upd_bot:yes":
+        if not update_flow or update_flow.get("stage") != "await_bottle_confirm":
+            await query.edit_message_text("הפעולה פגה. כתוב 'עדכן בקבוק' מחדש.")
+            return
+        known = _get_known_drinkers_from_df()
+        update_flow["stage"] = "await_drinker"
+        update_flow["known_drinkers"] = known
+        update_flow["selected_drinkers"] = []
+        _set_update_flow(context, update_flow)
+        if known:
+            kb = _build_drinker_keyboard(known, [])
+            await query.edit_message_text("מי שתה? (בחר אחד או יותר)", reply_markup=kb)
+        else:
+            await query.edit_message_text("מי שתה? (כתוב שם)")
+        return
+
+    if data == "upd_bot:no":
+        if not update_flow or update_flow.get("stage") != "await_bottle_confirm":
+            await query.edit_message_text("הפעולה פגה.")
+            return
+        update_flow["stage"] = "await_bottle_name"
+        _set_update_flow(context, update_flow)
+        await query.edit_message_text("כתוב את שם הבקבוק שוב:")
+        return
+
+    if data.startswith("upd_fix:"):
+        if not update_flow or update_flow.get("stage") != "await_fix_field":
+            await query.edit_message_text("הפעולה פגה. כתוב 'עדכן בקבוק' מחדש.")
+            return
+        try:
+            choice = int(data[len("upd_fix:"):])
+        except ValueError:
+            return
+        if choice == 5:
+            _clear_update_flow(context)
+            await query.edit_message_text("ביטלתי.")
+            return
+        stage_map = {
+            1: ("await_bottle_name", "כתוב שם בקבוק:"),
+            2: ("await_drinker", "מי שתה?"),
+            3: ("await_ml", "כמה מ\"ל?"),
+            4: ("await_glasses", "כמה כוסות?"),
+        }
+        if choice in stage_map:
+            update_flow["stage"], prompt = stage_map[choice]
+            _set_update_flow(context, update_flow)
+            await query.edit_message_text(prompt)
+        return
+
+
 async def handle_final_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handles upd_confirm:yes / upd_confirm:no InlineKeyboard callbacks
@@ -3968,13 +4674,25 @@ async def handle_final_confirm_callback(update: Update, context: ContextTypes.DE
     if data == "upd_confirm:no":
         update_flow["stage"] = "await_fix_field"
         _set_update_flow(context, update_flow)
+        fix_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("1. בקבוק", callback_data="upd_fix:1"),
+                InlineKeyboardButton("2. שותה", callback_data="upd_fix:2"),
+            ],
+            [
+                InlineKeyboardButton("3. כמות (מ\"ל)", callback_data="upd_fix:3"),
+                InlineKeyboardButton("4. כוסות", callback_data="upd_fix:4"),
+            ],
+            [InlineKeyboardButton("5. ביטול", callback_data="upd_fix:5")],
+        ])
         await query.edit_message_text(
             f"סיכום:\n"
             f"🥃 {update_flow['full_name']}\n"
             f"👤 {', '.join(update_flow.get('drinkers', []))}\n"
             f"📏 {update_flow['amount_ml']} מ\"ל\n"
             f"🥛 {update_flow['glasses_cnt']} כוסות\n\n"
-            f"מה לתקן?\n1. בקבוק\n2. שותה\n3. כמות (מ\"ל)\n4. כוסות\n5. ביטול"
+            f"מה לתקן?",
+            reply_markup=fix_kb
         )
         return
 
@@ -4051,9 +4769,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes = bytes(bio)
                 # Best-effort mime type
                 mime_type = "image/jpeg"
+                await context.bot.send_chat_action(update.effective_chat.id, "typing")
                 scan_raw = _gemini_label_scan(image_bytes=image_bytes, mime_type=mime_type)
-                scan_raw = sanitize_scan_raw(scan_raw)          # ✅ חדש - חובה
-                
+                scan_raw = sanitize_scan_raw(scan_raw)
+                scan_raw = _enrich_scan_if_needed(scan_raw)  # fallback: fill missing fields via Gemini knowledge
+
                 logging.info(f"SCAN NOSE normalized: {scan_raw.get('nose')}")
                 logging.info(f"SCAN PALATE normalized: {scan_raw.get('palate')}")
                 # Load current vocab DF for mapping
@@ -4084,14 +4804,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if dup_found:
                     _set_add_stage(context, "await_duplicate_confirm")
+                    dup_kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ כן, הוסף עותק", callback_data="add_dup:yes"),
+                        InlineKeyboardButton("❌ ביטול", callback_data="add_dup:no"),
+                    ]])
                     await update.message.reply_text(
                         f"⚠️ שים לב: הבקבוק *{payload.get('bottle_name')}* של *{payload.get('distillery')}* "
-                        f"כבר קיים במאגר שלך.\n"
-                        f"האם ברצונך להוסיף עותק נוסף? (כן/לא)"
+                        f"כבר קיים במאגר שלך.\nהאם ברצונך להוסיף עותק נוסף?",
+                        parse_mode="Markdown",
+                        reply_markup=dup_kb
                     )
                 else:
-                    _set_add_stage(context, "await_price")
-                    await update.message.reply_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+                    _set_add_stage(context, "await_scan_review")
+                    edit_kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✏️ ערוך שדות", callback_data="scan_edit"),
+                        InlineKeyboardButton("✅ המשך להוספה", callback_data="scan_cont"),
+                    ]])
+                    await update.message.reply_text(
+                        "הפרטים נכונים?",
+                        reply_markup=edit_kb
+                    )
                 return
             except Exception as e:
                 logging.exception(e)
@@ -4145,7 +4877,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = try_handle_extremes_sweet_smoky_rich_delicate(user_text, df)
     if ans:
         await update.message.reply_text(ans)
-        return    
+        return
+
+    # ── stock threshold filter: "מתחת ל-X% נשאר" ──
+    threshold_ans = try_handle_stock_threshold(user_text, active_df_ext)
+    if threshold_ans:
+        await update.message.reply_text(threshold_ans)
+        return
 
     # ----- שאלות ספציפיות על בקבוק בשם מפורש -----
     # לדוגמה: "האם Glenfiddich Project XX מתוק?" / "מה ABV של M&H Biblical?"
@@ -4192,6 +4930,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("ענה בבקשה כן/לא.")
         return
 
+    # await_scan_review: user typed instead of pressing button
+    if stage == "await_scan_review":
+        t = _normalize_text(user_text)
+        if any(_normalize_text(x) == t for x in _CONFIRM_YES) or t in ("כן", "yes", "המשך"):
+            _set_add_stage(context, "await_price")
+            await update.message.reply_text("מה המחיר ששילמת? (רק מספר, למשל 350)")
+        elif any(_normalize_text(x) == t for x in _CANCEL_WORDS):
+            _clear_add_flow(context)
+            await update.message.reply_text("ביטלתי.")
+        else:
+            _set_add_stage(context, "await_pre_price_edit")
+            await update.message.reply_text(
+                "שלח תיקונים בפורמט:\nfield=value, field=value\n"
+                "לדוגמה: age=12, region=Islay, alcohol_percentage=46"
+            )
+        return
+
+    # await_pre_price_edit: edit fields before price, then go to await_price
+    if stage == "await_pre_price_edit":
+        p = _get_add_payload(context)
+        raw = user_text
+        parts = [x.strip() for x in raw.split(",") if x.strip()]
+        for part in parts:
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = k.strip(); v = v.strip()
+            if not k:
+                continue
+            if k in ("age", "alcohol_percentage", "orignal_volume"):
+                try:
+                    p[k] = float(v) if "." in v else int(v)
+                except Exception:
+                    p[k] = v
+            elif k in ("nose", "palette", "casks_aged_in"):
+                p[k] = [s.strip() for s in re.split(r"[;|/]", v) if s.strip()]
+            elif k in ("limited_edition", "special_bottling", "was_a_gift", "was_discounted"):
+                p[k] = _normalize_text(v) in ("כן", "yes", "true", "1")
+            else:
+                p[k] = v
+        _set_add_payload(context, p)
+        _set_add_stage(context, "await_price")
+        await update.message.reply_text("עודכן! מה המחיר ששילמת? (רק מספר, למשל 350)")
+        return
+
     if stage == "await_price":
         m = re.search(r"(\d+(?:\.\d+)?)", user_text.replace(",", ""))
         if not m:
@@ -4202,7 +4985,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p["price_paid"] = round(price_paid, 2)
         _set_add_payload(context, p)
         _set_add_stage(context, "await_discount_q")
-        await update.message.reply_text("הייתה הנחה? (כן/לא)")
+        disc_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן", callback_data="add_disc:yes"),
+            InlineKeyboardButton("❌ לא", callback_data="add_disc:no"),
+        ]])
+        await update.message.reply_text("הייתה הנחה?", reply_markup=disc_kb)
         return
 
     if stage == "await_discount_q":
@@ -4214,7 +5001,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p["price_full"] = p.get("price_paid")
             _set_add_payload(context, p)
             _set_add_stage(context, "await_gift_q")
-            await update.message.reply_text("האם מדובר במתנה? (כן/לא)")
+            gift_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ כן", callback_data="add_gift:yes"),
+                InlineKeyboardButton("❌ לא", callback_data="add_gift:no"),
+            ]])
+            await update.message.reply_text("האם מדובר במתנה?", reply_markup=gift_kb)
             return
         if any(_normalize_text(x) == t for x in _CONFIRM_YES) or t in ("כן", "yes"):
             _set_add_stage(context, "await_discount_amount")
@@ -4242,7 +5033,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p["price_full"] = round(paid + amt, 2)
         _set_add_payload(context, p)
         _set_add_stage(context, "await_gift_q")
-        await update.message.reply_text("האם מדובר במתנה? (כן/לא)")
+        gift_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן", callback_data="add_gift:yes"),
+            InlineKeyboardButton("❌ לא", callback_data="add_gift:no"),
+        ]])
+        await update.message.reply_text("האם מדובר במתנה?", reply_markup=gift_kb)
         return
 
     if _looks_like_add_bottle(user_text):
@@ -4266,9 +5061,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         p = _get_add_payload(context)
         _set_add_stage(context, "await_confirm_insert")
+        conf_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן, הוסף", callback_data="add_conf:yes"),
+            InlineKeyboardButton("✏️ ערוך", callback_data="add_conf:edit"),
+            InlineKeyboardButton("❌ ביטול", callback_data="add_conf:no"),
+        ]])
         await update.message.reply_text("מעולה. זה הסיכום לפני הכנסה למאגר:")
         await update.message.reply_text(_format_add_summary(p))
-        await update.message.reply_text("לאשר הכנסת הבקבוק? (כן/לא)")
+        await update.message.reply_text("לאשר הכנסת הבקבוק?", reply_markup=conf_kb)
         return
 
     if stage == "await_confirm_insert":
@@ -4292,6 +5092,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await update.message.reply_text("ענה בבקשה כן/לא.")
+        return
+
+    # ── scan-edit: user typed a custom value for a field ───────────────────────
+    if stage == "await_se_custom":
+        se_ctx    = context.chat_data.get("se_ctx", {})
+        field_key = se_ctx.get("field_key", "")
+        label     = se_ctx.get("field_label", "")
+        ftype     = se_ctx.get("field_type", "text")
+        p = _get_add_payload(context)
+
+        if ftype == "numeric":
+            if not _se_apply_numeric(p, field_key, user_text.strip()):
+                await update.message.reply_text("❌ ערך לא תקין, הכנס מספר:")
+                return
+        elif ftype == "multi":
+            p[field_key] = [v.strip() for v in user_text.split(",") if v.strip()]
+        else:
+            p[field_key] = user_text.strip()
+
+        _set_add_payload(context, p)
+        context.chat_data.pop("se_ctx", None)
+        _set_add_stage(context, "await_se_field")
+        await update.message.reply_text(
+            _se_field_picker_text(p),
+            reply_markup=_build_field_picker_kb()
+        )
         return
 
     if stage == "await_edit_fields":
@@ -4335,9 +5161,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _set_add_payload(context, p)
         _set_add_stage(context, "await_confirm_insert")
+        conf_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן, הוסף", callback_data="add_conf:yes"),
+            InlineKeyboardButton("✏️ ערוך", callback_data="add_conf:edit"),
+            InlineKeyboardButton("❌ ביטול", callback_data="add_conf:no"),
+        ]])
         await update.message.reply_text("עודכן. זה הסיכום המעודכן:")
         await update.message.reply_text(_format_add_summary(p))
-        await update.message.reply_text("לאשר הכנסת הבקבוק? (כן/לא)")
+        await update.message.reply_text("לאשר הכנסת הבקבוק?", reply_markup=conf_kb)
         return
 
 
@@ -4522,7 +5353,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_flow["full_name"] = match["best_name"]
             update_flow["stage"] = "await_bottle_confirm"
             _set_update_flow(context, update_flow)
-            await update.message.reply_text(f"התכוונת ל: 🥃 {match['best_name']}? (כן / לא)")
+            bot_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ כן", callback_data="upd_bot:yes"),
+                InlineKeyboardButton("❌ לא", callback_data="upd_bot:no"),
+            ]])
+            await update.message.reply_text(
+                f"התכוונת ל: 🥃 {match['best_name']}?",
+                reply_markup=bot_kb
+            )
             return
 
         if stage == "await_duplicate_select":
@@ -4684,9 +5522,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if t_norm in [_normalize_text(x) for x in _CONFIRM_NO]:
                 update_flow["stage"] = "await_fix_field"
                 _set_update_flow(context, update_flow)
-                await update.message.reply_text(
-                    "מה לתקן?\n1. בקבוק\n2. שותה\n3. כמות (מ\"ל)\n4. כוסות\n5. ביטול"
-                )
+                fix_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("1. בקבוק", callback_data="upd_fix:1"),
+                        InlineKeyboardButton("2. שותה", callback_data="upd_fix:2"),
+                    ],
+                    [
+                        InlineKeyboardButton("3. כמות (מ\"ל)", callback_data="upd_fix:3"),
+                        InlineKeyboardButton("4. כוסות", callback_data="upd_fix:4"),
+                    ],
+                    [InlineKeyboardButton("5. ביטול", callback_data="upd_fix:5")],
+                ])
+                await update.message.reply_text("מה לתקן?", reply_markup=fix_kb)
                 return
             await update.message.reply_text("ענה כן או לא.")
             return
@@ -4822,6 +5669,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_df = df[df["stock_status_per"] > 0].copy()
 
         if looks_like_text_intent(user_text):
+            await context.bot.send_chat_action(update.effective_chat.id, "typing")
             # ───────────────────────────────────────────────────────────────
             # KEY FIX: if this looks like a GENERAL portfolio query
             # (e.g. "which bottles have Chocolate flavor?"), we must NOT
@@ -5461,6 +6309,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = get_all_data_as_df()
 
         try:
+            await context.bot.send_chat_action(update.effective_chat.id, "typing")
             # Same principle as above: if this is a general portfolio query,
             # call Gemini WITHOUT focus so it doesn't anchor on the last bottle.
             # ✅ follow-up על רשימה? הפעל Gemini על הסאב-DF
@@ -5493,12 +6342,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(reply)
                 return
 
-            await update.message.reply_text("לא הצלחתי להבין לגמרי את הבקשה. תנסה לנסח אחרת 🙏")
+            await update.message.reply_text(
+                "לא הצלחתי להבין 🙏\n\n"
+                "נסה לדוגמה:\n"
+                "• כמה נשאר מ-Glenfiddich 15?\n"
+                "• שתיתי 60ml Ardbeg 10\n"
+                "• איזה בקבוק הכי מעושן שלי?\n"
+                "• הוסף בקבוק\n\n"
+                "לרשימת כל האפשרויות: /help"
+            )
             return
 
         except Exception as e:
             logging.warning(f"Gemini DF engine error: {e}")
-            await update.message.reply_text("לא הצלחתי להבין לגמרי את הבקשה. תנסה לנסח אחרת 🙏")
+            await update.message.reply_text(
+                "לא הצלחתי להבין 🙏\n\n"
+                "נסה לדוגמה:\n"
+                "• כמה נשאר מ-Glenfiddich 15?\n"
+                "• שתיתי 60ml Ardbeg 10\n"
+                "• איזה בקבוק הכי מעושן שלי?\n"
+                "• הוסף בקבוק\n\n"
+                "לרשימת כל האפשרויות: /help"
+            )
             return
         
         
@@ -5511,8 +6376,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("list", list_cmd))
+    # Inline keyboard callbacks — ordered from most specific pattern to least
     application.add_handler(CallbackQueryHandler(handle_final_confirm_callback, pattern=r"^upd_confirm:"))
     application.add_handler(CallbackQueryHandler(handle_drinker_callback, pattern=r"^drk_"))
+    application.add_handler(CallbackQueryHandler(handle_update_bot_callback, pattern=r"^upd_bot:"))
+    application.add_handler(CallbackQueryHandler(handle_update_bot_callback, pattern=r"^upd_fix:"))
+    application.add_handler(CallbackQueryHandler(handle_add_flow_callback, pattern=r"^(scan_edit|scan_cont|add_dup:|add_disc:|add_gift:|add_conf:)"))
+    application.add_handler(CallbackQueryHandler(handle_scan_edit_callback, pattern=r"^se_"))
+    application.add_handler(CallbackQueryHandler(handle_list_page_callback, pattern=r"^list_page:"))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
