@@ -1655,7 +1655,8 @@ def _extract_days_from_timerange(text: str) -> int:
 def query_bottles_drunk_in_last_n_days(n_days: int, df: pd.DataFrame) -> list[dict]:
     cutoff = pd.Timestamp.now("UTC") - pd.Timedelta(days=n_days)
     
-    filtered = df[df["updating_time"] >= cutoff]
+    filtered = df[(df["updating_time"] >= cutoff) & (df["total_volume_consumed"] > 0.0) & (df["stock_status_per"] < 100)]
+
     
     grouped = (
         filtered
