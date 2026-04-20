@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v57"
+BOT_VERSION = "v58"
 import time
 import re
 import json
@@ -4218,12 +4218,60 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• עדכן בקבוק — תפריט מודרך עם כפתורים\n\n"
         "*➕ הוספת בקבוק חדש:*\n"
         "• הוסף בקבוק — ואז שלח תמונה של התווית\n\n"
+        "*❓ שאילתה על בקבוק ספציפי:*\n"
+        "• תשאל בקבוק — הדרכה לשאלה חופשית על בקבוק\n\n"
+        "*⚡ פעולות מהירות:* (לחץ על כפתור למטה)\n\n"
         "*📋 פקודות:*\n"
         "/list — רשימת כל הבקבוקים הפעילים\n"
         "/start — הפעלה מחדש\n"
         "/help — המדריך הזה"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ הוסף בקבוק", callback_data="help_act:add")],
+        [InlineKeyboardButton("🥃 עדכן בקבוק", callback_data="help_act:update")],
+        [InlineKeyboardButton("❓ תשאל בקבוק", callback_data="help_act:ask")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+# ==========================================
+# /help quick-action buttons (v58)
+# ==========================================
+async def handle_help_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the 3 quick-action buttons under /help: add / update / ask."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        action = query.data.split(":", 1)[1]
+    except Exception:
+        return
+
+    chat = update.effective_chat
+
+    if action == "add":
+        # Mirror the textual "הוסף בקבוק" trigger
+        context.chat_data["add_stage"] = "await_label_photo"
+        await context.bot.send_message(chat.id, "שלח לי תמונה של התווית.")
+        return
+
+    if action == "update":
+        # Mirror the textual "עדכן בקבוק" trigger
+        _set_update_flow(context, {"stage": "await_bottle_name"})
+        await context.bot.send_message(chat.id, "איזה בקבוק תרצה לעדכן?")
+        return
+
+    if action == "ask":
+        # Just guide the user to ask a free-form question about a bottle
+        await context.bot.send_message(
+            chat.id,
+            "כתוב שם של בקבוק/מזקקה ואחריו שאלה, למשל:\n"
+            "• כמה אחוז נשאר ב-Glenfiddich 15?\n"
+            "• מה ה-ABV של M&H Biblical?\n"
+            "• Ardbeg 10 — הוא מעושן?\n"
+            "• כמה פעמים שתיתי מה-Lagavulin 16?"
+        )
+        return
 
 
 # ==========================================
@@ -6387,6 +6435,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_add_flow_callback, pattern=r"^(scan_edit|scan_cont|add_dup:|add_disc:|add_gift:|add_conf:)"))
     application.add_handler(CallbackQueryHandler(handle_scan_edit_callback, pattern=r"^se_"))
     application.add_handler(CallbackQueryHandler(handle_list_page_callback, pattern=r"^list_page:"))
+    application.add_handler(CallbackQueryHandler(handle_help_action_callback, pattern=r"^help_act:"))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
