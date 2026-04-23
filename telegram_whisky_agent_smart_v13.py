@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v58"
+BOT_VERSION = "v60"
 import time
 import re
 import json
@@ -2002,7 +2002,7 @@ _TEXT_SEARCH_INTENT_RE = re.compile(
 )    
 
 _FOCUS_BACK_PRONOUNS_RE = re.compile(
-    r"\b(הוא|בו|בה|אותו|אותה|עליו|עליה|שלו|שלה|זה|הזה|הבקבוק הזה)\b",
+    r"(?<![\w])(הוא|בו|בה|אותו|אותה|עליו|עליה|שלו|שלה|ממנו|ממנה|איתו|איתה|לו|לה|זה|הזה|הבקבוק הזה)(?![\w])",
     re.IGNORECASE
 )
 
@@ -2057,7 +2057,10 @@ def _try_fast_portfolio_answer(user_text: str, df: pd.DataFrame):
 
 # Pronouns / placeholders that usually mean: "the one we just talked about"
 _FOCUS_PRONOUNS = (
-    "בו", "בזה", "באותו", "אותו", "זה", "הוא", "הבקבוק", "that", "it", "this", "him"
+    "בו", "בה", "בזה", "באותו", "אותו", "אותה", "זה", "הזה", "הוא", "היא",
+    "ממנו", "ממנה", "איתו", "איתה", "עליו", "עליה", "שלו", "שלה", "לו", "לה",
+    "הבקבוק", "הבקבוק הזה",
+    "that", "it", "this", "him", "her",
 )
 
 def _looks_like_popular_query(text: str) -> bool:
@@ -3959,7 +3962,7 @@ _SPECIFIC_BOTTLE_FREQ_RE = re.compile(
 )
 
 
-def _is_specific_bottle_question(user_text: str) -> bool:
+def _is_specific_bottle_question(user_text: str, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
     """
     מזהה שאלה שמכילה שם בקבוק ספציפי + שאלה על שדה כלשהו.
     שאלות כמו:
@@ -3967,8 +3970,12 @@ def _is_specific_bottle_question(user_text: str) -> bool:
     - "מה אחוז האלכוהול של Glenmorangie A Tale of Spices?"
     - "מה ה-rarity של Milk & Honey Biblical Origin?"
     - "מתי שתיתי Spey Tenne לאחרונה?"
-    - "מה הטעמים של M&H Under The Bridge?"
+    - "מה הטעמים of M&H Under The Bridge?"
     - "כמה נשאר ב GlenAllachie The 15th?"
+
+    v58: גם שאלות כינוי-בלבד ("מתי שתיתי ממנו לאחרונה", "האם הוא מתוק")
+    נחשבות specific bottle question — אבל רק אם יש focus bottle פעיל
+    (שאז הבקבוק ייפתר ב-try_handle_specific_bottle_question via focus fallback).
 
     שאלות עם "הכי" (extremes) נדחות — הן שייכות לloגיקת ה-extremes/group.
     """
@@ -4005,8 +4012,12 @@ def _is_specific_bottle_question(user_text: str) -> bool:
     )
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    # If what's left is basically a pronoun only -> not a "specific bottle" question
+    # If what's left is basically a pronoun only:
+    # v58: accept it IF there's an active focus bottle (it will be resolved via fallback).
+    # Otherwise reject — we don't know which bottle the user means.
     if _is_focus_placeholder(clean):
+        if context is not None and context.user_data.get("focus_bottle_id"):
+            return True
         return False
 
     return True
@@ -4040,6 +4051,25 @@ def try_handle_specific_bottle_question(
     match = find_best_bottle_match(clean_for_match, active_df)
     if not match.get("best_name") or float(match.get("score") or 0) < 0.62:
         match = find_best_bottle_match(user_text, active_df)
+
+    # ── v58: Pronoun-back fallback ──
+    # אם לא נמצא שם בקבוק בטקסט, אבל יש focus פעיל והמשתמש השתמש בכינוי
+    # כמו "הוא/ממנו/בו/אותו/עליו/שלו/זה" → השתמש בבקבוק שבפוקוס.
+    # זה מה שגורם לשאלות כמו "מתי שתיתי ממנו לאחרונה" / "כמה הוא פופולרי"
+    # לעבוד כ-follow-up על הבקבוק הנוכחי.
+    if (not match.get("best_name") or float(match.get("score") or 0) < 0.62) \
+            and _FOCUS_BACK_PRONOUNS_RE.search(user_text or ""):
+        focus_row = _get_focus_bottle_row(active_df, context)
+        if focus_row is not None:
+            fb_id = focus_row.get("bottle_id")
+            fb_name = str(focus_row.get("full_name") or focus_row.get("bottle_name") or "").strip()
+            if fb_id is not None and fb_name:
+                match = {
+                    "best_name": fb_name,
+                    "score": 1.0,
+                    "candidates": [{"bottle_id": int(fb_id), "full_name": fb_name, "score": 1.0}],
+                }
+
     if not match.get("best_name") or float(match.get("score") or 0) < 0.62:
         return None
 
@@ -4938,7 +4968,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # לדוגמה: "האם Glenfiddich Project XX מתוק?" / "מה ABV של M&H Biblical?"
     # חייב לרוץ לפני ה-pending flows כי הוא דטרמיניסטי ומהיר,
     # ולפני ה-flavor/cask/stock handlers כי הוא מטפל בכולם.
-    if _is_specific_bottle_question(user_text):
+    if _is_specific_bottle_question(user_text, context):
         active_df_for_specific = df[df["stock_status_per"] > 0].copy() if df is not None and not df.empty else None
         specific_df = active_df_for_specific if (active_df_for_specific is not None and not active_df_for_specific.empty) else df
         specific_ans = try_handle_specific_bottle_question(user_text, specific_df, context)
@@ -5922,6 +5952,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if _looks_like_popular_query(user_text):
+            # ── v58: Focus-aware popularity ──
+            # אם יש בקבוק בפוקוס והמשתמש השתמש בכינוי ("כמה הוא פופולרי?",
+            # "הפופולריות שלו"), החזר את מדד הפופולריות *של אותו בקבוק* ולא את
+            # הכי פופולרי בקולקציה.
+            if _FOCUS_BACK_PRONOUNS_RE.search(user_text or ""):
+                focus_row = _get_focus_bottle_row(active_df, context)
+                if focus_row is not None:
+                    fb_name = str(focus_row.get("full_name") or focus_row.get("bottle_name") or "").strip()
+                    fb_avg = pd.to_numeric(focus_row.get("avg_consumption_vol_per_day"), errors="coerce")
+                    if pd.isna(fb_avg):
+                        await update.message.reply_text(
+                            f"🥃 {fb_name}\n⚠️ אין לי נתוני Forecast (avg_consumption_vol_per_day) לבקבוק הזה."
+                        )
+                        return
+                    # דרג מול שאר הקולקציה כדי לתת הקשר
+                    sub_all = active_df.copy()
+                    sub_all["avg_consumption_vol_per_day"] = pd.to_numeric(
+                        sub_all["avg_consumption_vol_per_day"], errors="coerce"
+                    )
+                    sub_all = sub_all[pd.notnull(sub_all["avg_consumption_vol_per_day"])]
+                    total = len(sub_all)
+                    rank = None
+                    if total > 0:
+                        sorted_df = sub_all.sort_values("avg_consumption_vol_per_day", ascending=False).reset_index(drop=True)
+                        match_idx = sorted_df.index[sorted_df["bottle_id"] == focus_row.get("bottle_id")].tolist()
+                        if match_idx:
+                            rank = int(match_idx[0]) + 1
+                    sep = "━━━━━━━━━━━━━━━━━━"
+                    lines = [
+                        f"{sep}\n📈 פופולריות\n{sep}\n",
+                        f"🥃 {fb_name}",
+                        f"📊 Avg Consumption / Day: {float(fb_avg):.2f} ml",
+                    ]
+                    if rank is not None and total > 0:
+                        lines.append(f"🏅 מקום {rank} מתוך {total} בקבוקים פעילים")
+                    await update.message.reply_text("\n".join(lines))
+                    return
+
             # Flexible scope via Gemini planner (e.g., "most popular of M&H")
             plan = gemini_make_plan(user_text, active_df)
             scope_type = None
