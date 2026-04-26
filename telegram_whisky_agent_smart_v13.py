@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v60"
+BOT_VERSION = "v62"
 import time
 import re
 import json
@@ -4215,6 +4215,362 @@ def try_handle_specific_bottle_question(
     return None
 
 
+# ==========================================
+# Whisky Sommelier — guided recommendation flow (v61)
+# ==========================================
+# Each tuple: (range_low, range_high, hebrew_label, ideal_point)
+#  - "lower in range = better"  -> ideal at range_low
+#  - "center of range = better" -> ideal at midpoint
+#  - "higher in range = better" -> ideal at range_high
+_SOM_FLAVOR_RANGES = {
+    "sweet":  (0.00, 2.60,  "מתוק-פרחוני",     0.00),
+    "bitter": (2.61, 4.50,  "הדרי - מר",       (2.61 + 4.50) / 2.0),
+    "smoky":  (4.51, 15.00, "מינרלי - מעושן",  10.00),  # ideal capped at real-data max (~9.97)
+}
+_SOM_RICHNESS_RANGES = {
+    "light":  (0.00,  8.00,  "עדינה",   0.00),
+    "medium": (8.10,  12.50, "בינונית", (8.10 + 12.50) / 2.0),
+    "heavy":  (12.51, 35.00, "עשירה",   30.00),  # ideal capped at real-data max (~28.92)
+}
+# For ABV, ideal is always the high end of the chosen range.
+_SOM_ABV_RANGES = {
+    "std":     (40.00, 46.99, "סטנדרטי",          46.99),
+    "adv":     (47.00, 53.99, "למתקדמים",         53.99),
+    "cask":    (54.00, 62.99, "אזורי חוזק חבית",  62.99),
+    "extreme": (63.00, 75.00, "חוזק קיצוני",      75.00),
+}
+
+# Full possible scales — used to normalize distance-from-ideal into a 0..100 score.
+# Calibrated to the actual BigQuery data range, not the theoretical bounds.
+_SOM_FLAVOR_FULL_SCALE   = 10.0   # final_smoky_sweet_score: actual data 0.65..9.97
+_SOM_RICHNESS_FULL_SCALE = 30.0   # final_richness_score:    actual data 5.19..28.92
+_SOM_ABV_FULL_SCALE      = 35.0   # alcohol_percentage:      40..75 → 35 wide
+
+
+def _set_sommelier_flow(context, data: dict):
+    context.user_data["sommelier_flow"] = data
+
+def _get_sommelier_flow(context) -> "dict | None":
+    return context.user_data.get("sommelier_flow")
+
+def _clear_sommelier_flow(context):
+    context.user_data.pop("sommelier_flow", None)
+
+
+def _looks_like_sommelier_query(text: str) -> bool:
+    """Detects 'המלץ לי על וויסקי' / 'המלץ לי על ויסקי' (and minor variants)."""
+    if not text:
+        return False
+    t = _normalize_text(text)
+    # Accept both spellings (וויסקי / ויסקי) and 'תמליץ' as a synonym of 'המלץ'.
+    triggers = (
+        "המלץ לי על וויסקי",
+        "המלץ לי על ויסקי",
+        "תמליץ לי על וויסקי",
+        "תמליץ לי על ויסקי",
+        "מומחה וויסקי",
+        "מומחה ויסקי",
+    )
+    return any(trig in t for trig in triggers)
+
+
+def _compute_sommelier_recommendations(active_df: pd.DataFrame,
+                                       flavor_key: str,
+                                       richness_key: str,
+                                       abv_key: str,
+                                       k: int = 3) -> list:
+    """Return the top-k bottles ranked by overall match % to the chosen profile."""
+    if active_df is None or active_df.empty:
+        return []
+    needed = ["final_smoky_sweet_score", "final_richness_score",
+              "alcohol_percentage", "bottle_id", "distillery", "bottle_name"]
+    for col in needed:
+        if col not in active_df.columns:
+            return []
+
+    df = active_df.copy()
+    for col in ("final_smoky_sweet_score", "final_richness_score", "alcohol_percentage"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["final_smoky_sweet_score", "final_richness_score", "alcohol_percentage"])
+    if df.empty:
+        return []
+
+    # ── HARD FILTER #1: only bottles actually in stock. ──
+    # Defensive: handle NaN / string-typed values via to_numeric+fillna.
+    if "stock_status_per" in df.columns:
+        stock_num = pd.to_numeric(df["stock_status_per"], errors="coerce").fillna(0)
+        df = df[stock_num > 0]
+    if df.empty:
+        return []
+
+    flav_low,  flav_high,  _, flavor_ideal   = _SOM_FLAVOR_RANGES[flavor_key]
+    rich_low,  rich_high,  _, richness_ideal = _SOM_RICHNESS_RANGES[richness_key]
+    abv_low,   abv_high,   _, abv_ideal      = _SOM_ABV_RANGES[abv_key]
+
+    # ── HARD FILTER #2: bottle must fall within ALL three chosen category ranges. ──
+    # The categories are mutually exclusive — an "extreme strength" bottle is NOT
+    # a "cask strength" bottle even if it's very close to the boundary. Without
+    # this filter, the scoring would reward proximity to the ideal even across
+    # category lines (e.g. an out-of-range 65.3% scoring better than an in-range
+    # 54%, which is wrong by the user's stated intent).
+    df = df[
+        df["final_smoky_sweet_score"].between(flav_low, flav_high)
+        & df["final_richness_score"].between(rich_low, rich_high)
+        & df["alcohol_percentage"].between(abv_low, abv_high)
+    ]
+    if df.empty:
+        return []
+
+    def _score(value, ideal, full_scale):
+        try:
+            return max(0.0, 1.0 - abs(float(value) - float(ideal)) / float(full_scale)) * 100.0
+        except Exception:
+            return 0.0
+
+    df["som_flavor_pct"]   = df["final_smoky_sweet_score"].apply(lambda v: _score(v, flavor_ideal,   _SOM_FLAVOR_FULL_SCALE))
+    df["som_richness_pct"] = df["final_richness_score"].apply(lambda v: _score(v, richness_ideal, _SOM_RICHNESS_FULL_SCALE))
+    df["som_abv_pct"]      = df["alcohol_percentage"].apply(lambda v: _score(v, abv_ideal, _SOM_ABV_FULL_SCALE))
+    df["som_match_pct"]    = (df["som_flavor_pct"] + df["som_richness_pct"] + df["som_abv_pct"]) / 3.0
+
+    df = df.sort_values(by="som_match_pct", ascending=False).head(k)
+
+    out = []
+    for _, r in df.iterrows():
+        dist   = str(r.get("distillery") or "").strip()
+        bname  = str(r.get("bottle_name") or "").strip()
+        full   = str(r.get("full_name") or f"{dist} {bname}").strip()
+        out.append({
+            "bottle_id": int(r["bottle_id"]),
+            "distillery": dist,
+            "bottle_name": bname,
+            "full_name": full,
+            "alcohol_percentage": float(r["alcohol_percentage"]),
+            "match_pct": float(r["som_match_pct"]),
+        })
+    return out
+
+
+def _build_som_flavor_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍯 מתוק-פרחוני",      callback_data="som:flav:sweet")],
+        [InlineKeyboardButton("🍊 הדרי - מר",        callback_data="som:flav:bitter")],
+        [InlineKeyboardButton("🔥 מינרלי - מעושן",   callback_data="som:flav:smoky")],
+        [InlineKeyboardButton("❌ ביטול",             callback_data="som:cancel")],
+    ])
+
+def _build_som_richness_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🪶 עדינה",   callback_data="som:rich:light")],
+        [InlineKeyboardButton("⚖️ בינונית", callback_data="som:rich:medium")],
+        [InlineKeyboardButton("💪 עשירה",   callback_data="som:rich:heavy")],
+        [InlineKeyboardButton("❌ ביטול",   callback_data="som:cancel")],
+    ])
+
+def _build_som_abv_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("סטנדרטי (40-47%)",          callback_data="som:abv:std")],
+        [InlineKeyboardButton("למתקדמים (47-54%)",         callback_data="som:abv:adv")],
+        [InlineKeyboardButton("אזורי חוזק חבית (54-63%)",  callback_data="som:abv:cask")],
+        [InlineKeyboardButton("חוזק קיצוני (63-75%)",      callback_data="som:abv:extreme")],
+        [InlineKeyboardButton("❌ ביטול",                   callback_data="som:cancel")],
+    ])
+
+def _build_som_results_kb(recs: list) -> InlineKeyboardMarkup:
+    rows = []
+    for r in recs:
+        label = f"{r['distillery']} - {r['bottle_name']} - {r['alcohol_percentage']:.1f}%"
+        # Telegram inline-button text limit is 64 chars
+        if len(label) > 64:
+            label = label[:61] + "..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"som:pick:{r['bottle_id']}")])
+    rows.append([InlineKeyboardButton("❌ סגור", callback_data="som:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _sommelier_send_flavor_question(chat, bot, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point — open the sommelier flow at step 1 (flavor profile)."""
+    _set_sommelier_flow(context, {"stage": "await_flavor"})
+    await bot.send_message(
+        chat.id,
+        "🥃 *מומחה וויסקי*\n\nמה פרופיל הטעם שאת/ה מחפש/ת?",
+        parse_mode="Markdown",
+        reply_markup=_build_som_flavor_kb()
+    )
+
+
+async def handle_sommelier_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all som:* callbacks for the Whisky Sommelier flow."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    flow = _get_sommelier_flow(context) or {}
+
+    if data == "som:cancel":
+        _clear_sommelier_flow(context)
+        try:
+            await query.edit_message_text("ביטלתי את מומחה הוויסקי.")
+        except Exception:
+            pass
+        return
+
+    # Step 1: flavor profile → ask richness
+    if data.startswith("som:flav:"):
+        key = data.split(":", 2)[2]
+        if key not in _SOM_FLAVOR_RANGES:
+            return
+        flow["flavor"] = key
+        flow["stage"] = "await_richness"
+        _set_sommelier_flow(context, flow)
+        flav_label = _SOM_FLAVOR_RANGES[key][2]
+        await query.edit_message_text(
+            f"✅ פרופיל טעם: *{flav_label}*\n\nמה מידת הסמיכות?",
+            parse_mode="Markdown",
+            reply_markup=_build_som_richness_kb()
+        )
+        return
+
+    # Step 2: richness → ask ABV
+    if data.startswith("som:rich:"):
+        if flow.get("stage") != "await_richness" or "flavor" not in flow:
+            try:
+                await query.edit_message_text("הפעולה פגה. הקלד 'המלץ לי על וויסקי' מחדש.")
+            except Exception:
+                pass
+            return
+        key = data.split(":", 2)[2]
+        if key not in _SOM_RICHNESS_RANGES:
+            return
+        flow["richness"] = key
+        flow["stage"] = "await_abv"
+        _set_sommelier_flow(context, flow)
+        flav_label = _SOM_FLAVOR_RANGES[flow["flavor"]][2]
+        rich_label = _SOM_RICHNESS_RANGES[key][2]
+        await query.edit_message_text(
+            f"✅ פרופיל טעם: *{flav_label}*\n"
+            f"✅ סמיכות: *{rich_label}*\n\n"
+            f"כמה חזק את/ה רוצה את זה?",
+            parse_mode="Markdown",
+            reply_markup=_build_som_abv_kb()
+        )
+        return
+
+    # Step 3: ABV → compute & show top-3 results
+    if data.startswith("som:abv:"):
+        if flow.get("stage") != "await_abv" or "flavor" not in flow or "richness" not in flow:
+            try:
+                await query.edit_message_text("הפעולה פגה. הקלד 'המלץ לי על וויסקי' מחדש.")
+            except Exception:
+                pass
+            return
+        key = data.split(":", 2)[2]
+        if key not in _SOM_ABV_RANGES:
+            return
+        flow["abv"] = key
+
+        df_all = get_all_data_as_df()
+        recs = _compute_sommelier_recommendations(df_all, flow["flavor"], flow["richness"], flow["abv"])
+
+        if not recs:
+            _clear_sommelier_flow(context)
+            flav_label = _SOM_FLAVOR_RANGES[flow["flavor"]][2]
+            rich_label = _SOM_RICHNESS_RANGES[flow["richness"]][2]
+            abv_label  = _SOM_ABV_RANGES[flow["abv"]][2]
+            try:
+                await query.edit_message_text(
+                    "😕 לא מצאתי בקבוקים שמתאימים לכל 3 ההעדפות:\n"
+                    f"• טעם: *{flav_label}*\n"
+                    f"• סמיכות: *{rich_label}*\n"
+                    f"• חוזק: *{abv_label}*\n\n"
+                    "נסה לבחור צירוף אחר — אולי אחת ההעדפות מצמצמת מדי.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            return
+
+        flow["stage"] = "await_pick"
+        # store recs by bottle_id for quick lookup on pick
+        flow["recs"] = {r["bottle_id"]: r for r in recs}
+        _set_sommelier_flow(context, flow)
+
+        flav_label = _SOM_FLAVOR_RANGES[flow["flavor"]][2]
+        rich_label = _SOM_RICHNESS_RANGES[flow["richness"]][2]
+        abv_label  = _SOM_ABV_RANGES[flow["abv"]][2]
+
+        lines = [
+            "🎯 *מומחה וויסקי – ההמלצות שלי*",
+            f"טעם: *{flav_label}*  ·  סמיכות: *{rich_label}*  ·  חוזק: *{abv_label}*",
+            "",
+        ]
+        medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+        for i, r in enumerate(recs):
+            medal = medals.get(i, f"{i+1}.")
+            lines.append(
+                f"{medal} {r['distillery']} - {r['bottle_name']} - {r['alcohol_percentage']:.1f}%"
+                f"  ·  התאמה: *{round(r['match_pct'])}%*"
+            )
+        lines.append("")
+        lines.append("בחר/י בקבוק כדי לפתוח סשן עדכון מלאי 👇")
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=_build_som_results_kb(recs)
+        )
+        return
+
+    # Step 4: pick a bottle → hand off to the existing guided update flow
+    if data.startswith("som:pick:"):
+        if flow.get("stage") != "await_pick":
+            try:
+                await query.edit_message_text("הפעולה פגה. הקלד 'המלץ לי על וויסקי' מחדש.")
+            except Exception:
+                pass
+            return
+        try:
+            bottle_id = int(data.split(":", 2)[2])
+        except ValueError:
+            return
+        rec = (flow.get("recs") or {}).get(bottle_id)
+        if not rec:
+            try:
+                await query.edit_message_text("הבקבוק לא נמצא בהמלצות.")
+            except Exception:
+                pass
+            return
+
+        full_name = rec.get("full_name") or f"{rec['distillery']} {rec['bottle_name']}".strip()
+
+        # Hand off into the guided update flow at the drinker step
+        # (mirrors what handle_update_bot_callback / await_duplicate_select do).
+        known = _get_known_drinkers_from_df()
+        _set_update_flow(context, {
+            "stage": "await_drinker",
+            "bottle_id": bottle_id,
+            "full_name": full_name,
+            "known_drinkers": known,
+            "selected_drinkers": [],
+        })
+        # Also pin focus on this bottle, like other flows do.
+        _set_focus_bottle(context, {"bottle_id": bottle_id, "full_name": full_name})
+        _clear_sommelier_flow(context)
+
+        try:
+            await query.edit_message_text(
+                f"✅ נבחר: 🥃 {full_name}\nמתחילים סשן עדכון מלאי..."
+            )
+        except Exception:
+            pass
+
+        chat_id = update.effective_chat.id
+        if known:
+            kb = _build_drinker_keyboard(known, [])
+            await context.bot.send_message(chat_id, "מי שתה? (בחר אחד או יותר)", reply_markup=kb)
+        else:
+            await context.bot.send_message(chat_id, "מי שתה? (כתוב שם)")
+        return
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_update", None)
     context.user_data.pop("pending_count", None)
@@ -4243,6 +4599,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• איזה בקבוק הכי פופולרי שלי?\n"
         "• מה עדיף לפתוח עכשיו? (VFM)\n"
         "• איזה בקבוקים עתידים להיגמר בקרוב?\n\n"
+        "*🎯 מומחה וויסקי:*\n"
+        "• המלץ לי על וויסקי — בחירה מודרכת לפי טעם, סמיכות וחוזק\n\n"
         "*🥃 עדכון שתייה:*\n"
         "• שתיתי 60ml Glenfiddich 15\n"
         "• עדכן בקבוק — תפריט מודרך עם כפתורים\n\n"
@@ -4260,6 +4618,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ הוסף בקבוק", callback_data="help_act:add")],
         [InlineKeyboardButton("🥃 עדכן בקבוק", callback_data="help_act:update")],
         [InlineKeyboardButton("❓ תשאל בקבוק", callback_data="help_act:ask")],
+        [InlineKeyboardButton("🎯 מומחה וויסקי", callback_data="help_act:sommelier")],
     ])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -4301,6 +4660,11 @@ async def handle_help_action_callback(update: Update, context: ContextTypes.DEFA
             "• Ardbeg 10 — הוא מעושן?\n"
             "• כמה פעמים שתיתי מה-Lagavulin 16?"
         )
+        return
+
+    if action == "sommelier":
+        # Whisky Sommelier — guided 3-step recommendation flow (v61)
+        await _sommelier_send_flavor_question(chat, context.bot, context)
         return
 
 
@@ -4915,6 +5279,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = (update.message.text or "").strip() if update.message else ""
     if not user_text:
+        return
+
+    # ----- HARD RULE: Whisky Sommelier text trigger (v61) -----
+    # Must run BEFORE generic recommend handlers, since 'המלץ' alone routes
+    # to recommend_now, but 'המלץ לי על וויסקי' is the dedicated sommelier flow.
+    if _looks_like_sommelier_query(user_text):
+        await _sommelier_send_flavor_question(update.effective_chat, context.bot, context)
         return
 
 
@@ -6504,6 +6875,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_scan_edit_callback, pattern=r"^se_"))
     application.add_handler(CallbackQueryHandler(handle_list_page_callback, pattern=r"^list_page:"))
     application.add_handler(CallbackQueryHandler(handle_help_action_callback, pattern=r"^help_act:"))
+    application.add_handler(CallbackQueryHandler(handle_sommelier_callback, pattern=r"^som:"))
     application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_message))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
