@@ -1,6 +1,6 @@
 import logging
 
-BOT_VERSION = "v62"
+BOT_VERSION = "v66"
 import time
 import re
 import json
@@ -4278,22 +4278,30 @@ def _compute_sommelier_recommendations(active_df: pd.DataFrame,
                                        flavor_key: str,
                                        richness_key: str,
                                        abv_key: str,
-                                       k: int = 3) -> list:
-    """Return the top-k bottles ranked by overall match % to the chosen profile."""
+                                       k: int = 3) -> dict:
+    """
+    Return the top-k bottles ranked by overall match % to the chosen profile.
+    
+    Returns: {"tier": int, "bottles": list}
+      - tier=1: all 3 criteria matched
+      - tier=2: flavor + richness matched (ABV relaxed)
+      - tier=3: flavor only matched (richness + ABV relaxed)
+      - tier=None + empty bottles: no matches at all
+    """
     if active_df is None or active_df.empty:
-        return []
+        return {"tier": None, "bottles": []}
     needed = ["final_smoky_sweet_score", "final_richness_score",
               "alcohol_percentage", "bottle_id", "distillery", "bottle_name"]
     for col in needed:
         if col not in active_df.columns:
-            return []
+            return {"tier": None, "bottles": []}
 
     df = active_df.copy()
     for col in ("final_smoky_sweet_score", "final_richness_score", "alcohol_percentage"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["final_smoky_sweet_score", "final_richness_score", "alcohol_percentage"])
     if df.empty:
-        return []
+        return {"tier": None, "bottles": []}
 
     # ── HARD FILTER #1: only bottles actually in stock. ──
     # Defensive: handle NaN / string-typed values via to_numeric+fillna.
@@ -4301,25 +4309,50 @@ def _compute_sommelier_recommendations(active_df: pd.DataFrame,
         stock_num = pd.to_numeric(df["stock_status_per"], errors="coerce").fillna(0)
         df = df[stock_num > 0]
     if df.empty:
-        return []
+        return {"tier": None, "bottles": []}
 
     flav_low,  flav_high,  _, flavor_ideal   = _SOM_FLAVOR_RANGES[flavor_key]
     rich_low,  rich_high,  _, richness_ideal = _SOM_RICHNESS_RANGES[richness_key]
     abv_low,   abv_high,   _, abv_ideal      = _SOM_ABV_RANGES[abv_key]
 
-    # ── HARD FILTER #2: bottle must fall within ALL three chosen category ranges. ──
-    # The categories are mutually exclusive — an "extreme strength" bottle is NOT
-    # a "cask strength" bottle even if it's very close to the boundary. Without
-    # this filter, the scoring would reward proximity to the ideal even across
-    # category lines (e.g. an out-of-range 65.3% scoring better than an in-range
-    # 54%, which is wrong by the user's stated intent).
-    df = df[
-        df["final_smoky_sweet_score"].between(flav_low, flav_high)
-        & df["final_richness_score"].between(rich_low, rich_high)
-        & df["alcohol_percentage"].between(abv_low, abv_high)
+    # ── TIERED RELAXATION: try progressively looser filters until we get results. ──
+    # Priority order: flavor > richness > ABV.
+    # Tier 1 = all 3 criteria; Tier 2 = flavor+richness; Tier 3 = flavor only.
+    df_work = df.copy()
+    tier = None
+    matched_df = None
+
+    # Tier 1: ALL three criteria (ideal case)
+    t1 = df_work[
+        df_work["final_smoky_sweet_score"].between(flav_low, flav_high)
+        & df_work["final_richness_score"].between(rich_low, rich_high)
+        & df_work["alcohol_percentage"].between(abv_low, abv_high)
     ]
-    if df.empty:
-        return []
+    if not t1.empty:
+        matched_df = t1
+        tier = 1
+    else:
+        # Tier 2: flavor + richness only (relax ABV)
+        t2 = df_work[
+            df_work["final_smoky_sweet_score"].between(flav_low, flav_high)
+            & df_work["final_richness_score"].between(rich_low, rich_high)
+        ]
+        if not t2.empty:
+            matched_df = t2
+            tier = 2
+        else:
+            # Tier 3: flavor only (relax richness + ABV)
+            t3 = df_work[
+                df_work["final_smoky_sweet_score"].between(flav_low, flav_high)
+            ]
+            if not t3.empty:
+                matched_df = t3
+                tier = 3
+            else:
+                # Nothing matches even flavor profile → genuinely empty
+                return {"tier": None, "bottles": []}
+
+    df = matched_df
 
     def _score(value, ideal, full_scale):
         try:
@@ -4332,7 +4365,16 @@ def _compute_sommelier_recommendations(active_df: pd.DataFrame,
     df["som_abv_pct"]      = df["alcohol_percentage"].apply(lambda v: _score(v, abv_ideal, _SOM_ABV_FULL_SCALE))
     df["som_match_pct"]    = (df["som_flavor_pct"] + df["som_richness_pct"] + df["som_abv_pct"]) / 3.0
 
-    df = df.sort_values(by="som_match_pct", ascending=False).head(k)
+    # ── PRIORITIZE OPENED BOTTLES (v66) ──
+    # Opened = stock_status_per < 100; Sealed = 100.
+    # Sort: opened first (is_open=True → 1), then by match_pct descending.
+    if "stock_status_per" in df.columns:
+        stock_pct = pd.to_numeric(df["stock_status_per"], errors="coerce").fillna(100)
+        df["is_open"] = (stock_pct < 100).astype(int)
+    else:
+        df["is_open"] = 0  # fallback if column missing
+
+    df = df.sort_values(by=["is_open", "som_match_pct"], ascending=[False, False]).head(k)
 
     out = []
     for _, r in df.iterrows():
@@ -4345,9 +4387,43 @@ def _compute_sommelier_recommendations(active_df: pd.DataFrame,
             "bottle_name": bname,
             "full_name": full,
             "alcohol_percentage": float(r["alcohol_percentage"]),
-            "match_pct": float(r["som_match_pct"]),
+            "match_pct":    float(r["som_match_pct"]),
+            "flavor_pct":   float(r["som_flavor_pct"]),
+            "richness_pct": float(r["som_richness_pct"]),
+            "abv_pct":      float(r["som_abv_pct"]),
         })
-    return out
+    return {"tier": tier, "bottles": out}
+
+
+def _som_bar(pct: float, segments: int = 10) -> str:
+    """
+    Render a gradient progress bar using colored emoji squares.
+    
+    Each segment's color is determined by its POSITION in the bar (not by the pct),
+    creating a red→orange→yellow→green gradient. Only the number of filled segments
+    changes based on pct.
+    
+    Gradient map (0-indexed segment → emoji):
+      0-2: 🟥 dark red
+      3-4: 🟧 orange
+      5-6: 🟨 yellow
+      7-9: 🟩 green
+    Empty segments: ⬜
+    """
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round(pct / 100.0 * segments))
+    filled = max(0, min(segments, filled))
+    
+    # Color map: segment index → emoji
+    gradient = ["🟥", "🟥", "🟥", "🟧", "🟧", "🟨", "🟨", "🟩", "🟩", "🟩"]
+    
+    bar = ""
+    for i in range(segments):
+        if i < filled:
+            bar += gradient[i]
+        else:
+            bar += "⬜"
+    return bar
 
 
 def _build_som_flavor_kb() -> InlineKeyboardMarkup:
@@ -4468,7 +4544,9 @@ async def handle_sommelier_callback(update: Update, context: ContextTypes.DEFAUL
         flow["abv"] = key
 
         df_all = get_all_data_as_df()
-        recs = _compute_sommelier_recommendations(df_all, flow["flavor"], flow["richness"], flow["abv"])
+        result = _compute_sommelier_recommendations(df_all, flow["flavor"], flow["richness"], flow["abv"])
+        tier = result["tier"]
+        recs = result["bottles"]
 
         if not recs:
             _clear_sommelier_flow(context)
@@ -4477,11 +4555,11 @@ async def handle_sommelier_callback(update: Update, context: ContextTypes.DEFAUL
             abv_label  = _SOM_ABV_RANGES[flow["abv"]][2]
             try:
                 await query.edit_message_text(
-                    "😕 לא מצאתי בקבוקים שמתאימים לכל 3 ההעדפות:\n"
+                    "😕 לא מצאתי בקבוקים במלאי שמתאימים אפילו לפרופיל הטעם שביקשת:\n"
                     f"• טעם: *{flav_label}*\n"
                     f"• סמיכות: *{rich_label}*\n"
                     f"• חוזק: *{abv_label}*\n\n"
-                    "נסה לבחור צירוף אחר — אולי אחת ההעדפות מצמצמת מדי.",
+                    "נסה לבחור צירוף אחר.",
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -4491,6 +4569,7 @@ async def handle_sommelier_callback(update: Update, context: ContextTypes.DEFAUL
         flow["stage"] = "await_pick"
         # store recs by bottle_id for quick lookup on pick
         flow["recs"] = {r["bottle_id"]: r for r in recs}
+        flow["tier"] = tier
         _set_sommelier_flow(context, flow)
 
         flav_label = _SOM_FLAVOR_RANGES[flow["flavor"]][2]
@@ -4500,15 +4579,37 @@ async def handle_sommelier_callback(update: Update, context: ContextTypes.DEFAUL
         lines = [
             "🎯 *מומחה וויסקי – ההמלצות שלי*",
             f"טעם: *{flav_label}*  ·  סמיכות: *{rich_label}*  ·  חוזק: *{abv_label}*",
-            "",
         ]
+        
+        # Add relaxation notice if tier < 1
+        if tier == 2:
+            lines.append("")
+            lines.append("⚠️ לא נמצאה התאמה מושלמת — הנה הכי קרוב:")
+            lines.append(f"✅ פרופיל טעם: *{flav_label}*")
+            lines.append(f"✅ סמיכות: *{rich_label}*")
+            lines.append(f"❌ חוזק: *{abv_label}* (לא זמין, הורחב לכל הטווחים)")
+        elif tier == 3:
+            lines.append("")
+            lines.append("⚠️ לא נמצאה התאמה מושלמת — הנה הכי קרוב:")
+            lines.append(f"✅ פרופיל טעם: *{flav_label}*")
+            lines.append(f"❌ סמיכות: *{rich_label}* (לא זמין)")
+            lines.append(f"❌ חוזק: *{abv_label}* (לא זמין)")
+        
         medals = {0: "🥇", 1: "🥈", 2: "🥉"}
         for i, r in enumerate(recs):
             medal = medals.get(i, f"{i+1}.")
+            f_pct = round(r["flavor_pct"])
+            r_pct = round(r["richness_pct"])
+            a_pct = round(r["abv_pct"])
+            lines.append("")  # blank line between bottles
             lines.append(
-                f"{medal} {r['distillery']} - {r['bottle_name']} - {r['alcohol_percentage']:.1f}%"
+                f"{medal} *{r['distillery']} - {r['bottle_name']} - {r['alcohol_percentage']:.1f}%*"
                 f"  ·  התאמה: *{round(r['match_pct'])}%*"
             )
+            # Per-metric breakdown bars (monospace via backticks for consistent alignment)
+            lines.append(f"🍯 טעם     `{_som_bar(f_pct)}` {f_pct}%")
+            lines.append(f"💪 סמיכות  `{_som_bar(r_pct)}` {r_pct}%")
+            lines.append(f"🥃 חוזק    `{_som_bar(a_pct)}` {a_pct}%")
         lines.append("")
         lines.append("בחר/י בקבוק כדי לפתוח סשן עדכון מלאי 👇")
 
